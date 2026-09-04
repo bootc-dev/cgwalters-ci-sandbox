@@ -199,7 +199,7 @@ checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 [[package]]
 name = "bcvk-qemu"
 version = "0.1.0"
-source = "git+https://github.com/bootc-dev/bcvk?rev=0954cb338a65a460d297cba93b42f7917e921df1#0954cb338a65a460d297cba93b42f7917e921df1"
+source = "git+https://github.com/bootc-dev/bcvk?rev=79f105b48f8ea1e003cd821cdc5a587b41a1864c#79f105b48f8ea1e003cd821cdc5a587b41a1864c"
 dependencies = [
  "camino",
  "cap-std-ext",
