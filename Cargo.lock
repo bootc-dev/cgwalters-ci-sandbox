@@ -123,9 +123,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.42"
+version = "0.4.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e79b3f8a79cccc2898f31920fc69f304859b3bd567490f75ebf51ae1c792a9ac"
+checksum = "515a1f282e33d55983c499d7e9e87082e81cbc32974825bf9032f928392d5844"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -353,7 +353,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
- "comfy-table",
+ "comfy-table 7.2.2",
  "composefs-ctl",
  "etc-merge",
  "fn-error-context",
@@ -731,6 +731,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "comfy-table"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "136c8c4c3823846e8ba6d4bda011b4e5d5827b8bb0ac26c31f9ab31abe9f54f2"
+dependencies = [
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "comma"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -738,8 +748,8 @@ checksum = "55b672471b4e9f9e95499ea597ff64941a309b2cdbffcc46f2cc5e2d971fd335"
 
 [[package]]
 name = "composefs"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "composefs-ioctls",
@@ -747,12 +757,12 @@ dependencies = [
  "hex",
  "log",
  "once_cell",
+ "openssl",
  "rand 0.10.2",
  "rustix",
  "serde",
  "serde_json",
  "serde_repr",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
@@ -765,8 +775,8 @@ dependencies = [
 
 [[package]]
 name = "composefs-boot"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "composefs",
@@ -781,14 +791,14 @@ dependencies = [
 
 [[package]]
 name = "composefs-ctl"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "cap-std-ext",
  "clap",
  "clap_complete",
- "comfy-table",
+ "comfy-table 8.0.0",
  "composefs",
  "composefs-boot",
  "composefs-fuse",
@@ -810,8 +820,8 @@ dependencies = [
 
 [[package]]
 name = "composefs-fuse"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "composefs",
@@ -825,8 +835,8 @@ dependencies = [
 
 [[package]]
 name = "composefs-ioctls"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "rustix",
  "thiserror 2.0.19",
@@ -834,8 +844,8 @@ dependencies = [
 
 [[package]]
 name = "composefs-oci"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -855,7 +865,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "tar-core",
  "thiserror 2.0.19",
  "tokio",
@@ -868,21 +877,21 @@ dependencies = [
 
 [[package]]
 name = "composefs-splitdirfdstream"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
+ "openssl",
  "rand 0.10.2",
  "rand_pcg",
  "rustix",
- "sha2 0.11.0",
  "thiserror 2.0.19",
  "tokio",
 ]
 
 [[package]]
 name = "composefs-storage"
-version = "0.7.0"
-source = "git+https://github.com/composefs/composefs-rs?rev=0fbc853325ff92dbb842e715611bed7ddf9fe169#0fbc853325ff92dbb842e715611bed7ddf9fe169"
+version = "0.9.1"
+source = "git+https://github.com/composefs/composefs-rs?rev=28d72a8cc1c0b3ec28a2693242a7cf800b20a84d#28d72a8cc1c0b3ec28a2693242a7cf800b20a84d"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -906,9 +915,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.38"
+version = "0.4.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce2548391e9c1929c21bf6aa2680af86fe4c1b33e6cea9ac1cfeec0bd11218cf"
+checksum = "2fe67f2944eef52fc7b106b8c9450d243a88701a0c065f7f57235e76abaed7df"
 dependencies = [
  "compression-core",
  "flate2",
@@ -919,9 +928,9 @@ dependencies = [
 
 [[package]]
 name = "compression-core"
-version = "0.4.32"
+version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
+checksum = "6e8ccc4ea9f6acc32d102c0f6d471d11d913ad15f20c04de743374861fa1d414"
 
 [[package]]
 name = "concurrent-queue"
@@ -2426,7 +2435,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_mangen",
- "comfy-table",
+ "comfy-table 7.2.2",
  "composefs-ctl",
  "containers-image-proxy",
  "flate2",
