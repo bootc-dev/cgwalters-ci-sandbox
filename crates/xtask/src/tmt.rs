@@ -69,6 +69,16 @@ fn sanitize_plan_name(plan: &str) -> String {
     }
 }
 
+fn boot_context(boot_type: &crate::BootType, seal_state: Option<&SealState>) -> [String; 2] {
+    [
+        format!("--context=boot_type={boot_type}"),
+        format!(
+            "--context=seal_state={}",
+            seal_state.map_or("unspecified".to_string(), ToString::to_string)
+        ),
+    ]
+}
+
 /// Check that required dependencies are available
 #[context("Checking dependencies")]
 fn check_dependencies(sh: &Shell) -> Result<()> {
@@ -378,6 +388,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         .chain(std::iter::once(format!(
             "--context=VARIANT_ID={variant_id}"
         )))
+        .chain(boot_context(&args.boot_type, args.seal_state.as_ref()))
         .collect::<Vec<_>>();
     let preserve_vm = args.preserve_vm;
 
@@ -425,9 +436,13 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
     // Get the list of plans
     println!("Discovering test plans...");
-    let plans_output = cmd!(sh, "tmt plan ls")
-        .read()
-        .context("Getting list of test plans")?;
+    let discovery_context = context.clone();
+    let plans_output = cmd!(
+        sh,
+        "tmt {discovery_context...} plan ls --filter enabled:true"
+    )
+    .read()
+    .context("Getting list of test plans")?;
 
     let mut plans: Vec<&str> = plans_output
         .lines()
@@ -1398,6 +1413,21 @@ fn generate_integration() -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_boot_context_values() {
+        assert_eq!(
+            boot_context(&crate::BootType::Uki, Some(&SealState::Sealed)),
+            ["--context=boot_type=uki", "--context=seal_state=sealed"]
+        );
+        assert_eq!(
+            boot_context(&crate::BootType::Bls, None),
+            [
+                "--context=boot_type=bls",
+                "--context=seal_state=unspecified"
+            ]
+        );
+    }
 
     #[test]
     fn test_parse_tmt_metadata_basic() {
