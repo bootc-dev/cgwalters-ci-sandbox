@@ -3,6 +3,10 @@ description: 'Install a pinned version of tmt (Test Management Tool)'
 runs:
   using: 'composite'
   steps:
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12.14'
     - name: Install tmt
       shell: bash
       run: |
