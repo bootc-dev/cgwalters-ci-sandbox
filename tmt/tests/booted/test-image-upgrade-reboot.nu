@@ -4,6 +4,10 @@
 # tmt:
 #   summary: Execute local upgrade tests
 #   duration: 30m
+#   adjust:
+#     - when: distro == centos-9 and boot_type == uki and seal_state == sealed
+#       enabled: false
+#       because: CentOS 9 cannot consume the signed host upgrade because shared storage is unavailable and its guest-local UKI builder produces unsigned images
 #
 # This test does:
 # bootc image copy-to-storage
