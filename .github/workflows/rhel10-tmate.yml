@@ -11,60 +11,74 @@ jobs:
   investigate:
     name: RHEL 10 tmate investigation
     runs-on: rhel10-x86_64-16c-64g
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - name: Bootstrap RHEL tools
         run: sudo dnf install -y git-core podman curl tar gzip gcc
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
 
-      # cgwalters-bot has no public GitHub SSH key, so actor-only access cannot
-      # authenticate from this shell.  This temporary, secret-free branch uses
-      # the documented SSH-address mode; the address is a bearer secret.
-      - name: Start tmate session
-        id: tmate
-        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113
-        with:
-          install-dependencies: true
-          limit-access-to-actor: false
-          detached: true
-          connect-timeout-seconds: 600
-
-      - name: Test SSH connection
-        env:
-          TMATE_SSH_ADDRESS: ${{ steps.tmate.outputs.ssh-address }}
+      - name: Diagnose exact tmate binary
         run: |
           set -euo pipefail
-          echo "::add-mask::$TMATE_SSH_ADDRESS"
-          test -n "$TMATE_SSH_ADDRESS"
-          ssh_opts=(-tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30)
-          # The single-quoted command is intentionally evaluated on the runner.
-          # shellcheck disable=SC2016
-          timeout --signal=TERM --kill-after=10s 90s \
-            ssh "${ssh_opts[@]}" "$TMATE_SSH_ADDRESS" \
-            'uname -a; id; pwd; printf "hostname=%s runner_name=%s\n" "$(hostname)" "${RUNNER_NAME:-unset}"'
+          tmate_version=2.4.0
+          tmate=/tmp/tmate/tmate
+          socket=/tmp/tmate.sock
+          rm -rf /tmp/tmate "$socket" /tmp/tmate.log /tmp/tmate.bashrc
+          mkdir -p /tmp/tmate
+          curl --fail --location --silent --show-error \
+            "https://github.com/tmate-io/tmate/releases/download/${tmate_version}/tmate-${tmate_version}-static-linux-amd64.tar.xz" \
+            -o /tmp/tmate.tar.xz
+          tar x -C /tmp/tmate -f /tmp/tmate.tar.xz --strip-components=1
+          rm /tmp/tmate.tar.xz
+          printf 'binary=%s\n' "$tmate"
+          "$tmate" --version
+          file "$tmate"
+          ldd "$tmate" || true
 
-      - name: Run bounded remote diagnostics
-        if: always()
-        env:
-          TMATE_SSH_ADDRESS: ${{ steps.tmate.outputs.ssh-address }}
-        run: |
-          set -euo pipefail
-          echo "::add-mask::$TMATE_SSH_ADDRESS"
-          test -n "$TMATE_SSH_ADDRESS"
-          ssh_opts=(-tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30)
-          # The single-quoted command is intentionally evaluated on the runner.
-          # shellcheck disable=SC2016
-          timeout --signal=TERM --kill-after=10s 120s \
-            ssh "${ssh_opts[@]}" "$TMATE_SSH_ADDRESS" 'set -e
-              printf "remote hostname=%s runner_name=%s\n" "$(hostname)" "${RUNNER_NAME:-unset}"
-              test -d "$GITHUB_WORKSPACE"
-              cd "$GITHUB_WORKSPACE"
-              git status --short --branch
-              podman --version'
+          printf '\nDNS and endpoint reachability (bounded):\n'
+          getent ahosts ssh.tmate.io || true
+          getent ahosts tmate.io || true
+          timeout 10 bash -c '</dev/tcp/ssh.tmate.io/22' && echo 'ssh.tmate.io:22 tcp=reachable' || echo 'ssh.tmate.io:22 tcp=unreachable'
+          timeout 10 curl --fail --silent --show-error --connect-timeout 5 --max-time 10 -o /dev/null -w 'https://tmate.io tls/http=%{http_code}\n' https://tmate.io/ || echo 'https://tmate.io tls/http=unreachable'
+
+          # This is the exact non-secret configuration assembled by src/index.js.
+          printf 'set +e\n' > /tmp/tmate.bashrc
+          config='set-option -g default-command "bash --rcfile /tmp/tmate.bashrc" \\; new-session -d'
+          printf 'Generated config: %s\n' "$config"
+          tmate_args=(-S "$socket" -v set-option -g default-command 'bash --rcfile /tmp/tmate.bashrc' ';' new-session -d)
+          "$tmate" "${tmate_args[@]}" >/tmp/tmate.start.out 2>/tmp/tmate.log &
+          tmate_pid=$!
+          cleanup() {
+            "$tmate" -S "$socket" kill-session -a >/dev/null 2>&1 || true
+            kill "$tmate_pid" >/dev/null 2>&1 || true
+            wait "$tmate_pid" >/dev/null 2>&1 || true
+            rm -f "$socket"
+          }
+          trap cleanup EXIT
+          sleep 2
+          set +e
+          timeout --signal=TERM --kill-after=5s 30s "$tmate" -S "$socket" wait tmate-ready
+          ready_rc=$?
+          set -e
+          printf 'tmate wait tmate-ready rc=%s (30-second bound)\n' "$ready_rc"
+          printf 'tmate debug log summary:\n'
+          timeout 5 grep -E '(^| )(error|warning|connect|server|ready)' /tmp/tmate.log | head -40 || true
+          for format in '#{tmate_status}' '#{tmate_ssh}' '#{tmate_web}'; do
+            set +e
+            value=$(timeout 10 "$tmate" -S "$socket" display -p "$format" 2>/tmp/tmate.display.err)
+            display_rc=$?
+            set -e
+            # Treat all connection strings as bearer secrets: mask before any output.
+            if [[ "$format" != '#{tmate_status}' && -n "$value" ]]; then
+              echo "::add-mask::$value"
+              value='[masked]'
+            fi
+            printf '%s rc=%s value=%s\n' "$format" "$display_rc" "${value:-[empty]}"
+          done
 
       - name: Terminate tmate session
         if: always()
