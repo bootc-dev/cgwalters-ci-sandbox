@@ -1,0 +1,35 @@
+name: Larger runners smoke test
+
+on:
+  push:
+    branches: [larger-runners]
+
+permissions:
+  contents: read
+
+jobs:
+  x86-64:
+    runs-on: oracle-8cpu-32gb-x86-64
+    steps:
+      - name: Report runner system
+        run: |
+          set -eux
+          uname -a
+          printf 'architecture: '
+          uname -m
+          printf 'cpus: '
+          nproc
+          cat /etc/os-release
+
+  arm64:
+    runs-on: oracle-16cpu-64gb-arm64
+    steps:
+      - name: Report runner system
+        run: |
+          set -eux
+          uname -a
+          printf 'architecture: '
+          uname -m
+          printf 'cpus: '
+          nproc
+          cat /etc/os-release
