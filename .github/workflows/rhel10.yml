@@ -46,6 +46,150 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install RHEL VM and TMT prerequisites
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          printf '%s\n' '--- virtualization and package probes before setup ---'
+          id
+          groups
+          stat -c '%A %U:%G %t:%T %n' /dev/kvm 2>&1 || true
+          lscpu 2>&1 | grep -E 'Architecture|Virtualization|Hypervisor|Flags' || true
+          printf '%s\n' '--- SELinux ---'
+          getenforce 2>&1 || true
+          printf '%s\n' '--- RHEL package providers ---'
+          for query in \
+            'tmt' 'libvirt-client' 'libvirt-daemon-driver-qemu' \
+            'qemu-kvm-core' 'qemu-img' 'edk2-ovmf' 'virtiofsd' \
+            'dbus-daemon' 'acl'; do
+            printf 'query=%s\n' "$query"
+            timeout 30s sudo dnf repoquery --available --latest-limit=1 \
+              --qf '%{name}-%{evr}.%{arch}' "$query" 2>&1 || true
+          done
+          for query in '*/qemu-system-x86_64' '*/virtiofsd' '*/OVMF_CODE.fd'; do
+            printf 'provider=%s\n' "$query"
+            timeout 30s sudo dnf repoquery --available --whatprovides "$query" \
+              --qf '%{name}-%{evr}.%{arch}' 2>&1 || true
+          done
+
+          # Resolve each package against the enabled RHEL repositories rather
+          # than assuming Ubuntu package names.  The alternatives are needed
+          # because RHEL 10 split the QEMU and libvirt subpackages differently
+          # across repository snapshots.
+          resolve_package() {
+            local candidate result
+            for candidate in "$@"; do
+              result=$(sudo dnf -q repoquery --available --latest-limit=1 \
+                --qf '%{name}' "$candidate" 2>/dev/null |
+                grep -E '^[A-Za-z0-9][A-Za-z0-9+._-]*$' | sort -u)
+              if [ -n "$result" ]; then
+                printf '%s\n' "$result"
+                return 0
+              fi
+            done
+            printf 'No enabled repository package matched: %s\n' "$*" >&2
+            return 1
+          }
+          vm_packages=()
+          vm_packages+=("$(resolve_package libvirt-client)")
+          vm_packages+=("$(resolve_package libvirt-daemon)")
+          vm_packages+=("$(resolve_package libvirt-daemon-driver-qemu)")
+          vm_packages+=("$(resolve_package '*/virtstoraged')")
+          vm_packages+=("$(resolve_package qemu-kvm-core qemu-kvm qemu-system-x86-core)")
+          vm_packages+=("$(resolve_package qemu-img qemu-img-core)")
+          vm_packages+=("$(resolve_package edk2-ovmf)")
+          vm_packages+=("$(resolve_package virtiofsd)")
+          vm_packages+=("$(resolve_package python3-pip)")
+          vm_packages+=("$(resolve_package dbus-daemon)")
+          vm_packages+=("$(resolve_package acl)")
+          vm_packages+=("$(resolve_package swtpm)")
+          vm_packages+=("$(resolve_package swtpm-tools)")
+          printf 'Installing resolved RHEL packages: %s\n' "${vm_packages[*]}"
+          sudo dnf install -y "${vm_packages[@]}"
+
+          # bcvk is distributed as a release binary; it is not an Ubuntu/RHEL
+          # package.  Keep the upstream tool version used by the existing VM
+          # setup, while leaving action references mutable as this project does.
+          export BCVK_VERSION=0.19.0
+          bcvk_asset="bcvk-$(arch)-unknown-linux-gnu"
+          bcvk_tmp=$(mktemp -d)
+          trap 'rm -rf "$bcvk_tmp"' EXIT
+          curl --fail --show-error --location --retry 5 --retry-delay 10 \
+            --retry-max-time 300 --output "$bcvk_tmp/$bcvk_asset.tar.gz" \
+            "https://github.com/bootc-dev/bcvk/releases/download/v${BCVK_VERSION}/${bcvk_asset}.tar.gz"
+          tar -xzf "$bcvk_tmp/$bcvk_asset.tar.gz" -C "$bcvk_tmp"
+          sudo install -m 0755 "$bcvk_tmp/$bcvk_asset" /usr/local/bin/bcvk
+          bcvk --version
+
+          # RHEL 10.2's enabled repositories do not provide a tmt RPM (the
+          # repoquery probe above is intentional evidence of that), so install
+          # the test runner into the disposable job user's Python environment.
+          if ! command -v tmt >/dev/null 2>&1; then
+            python3 -m pip install --user --upgrade tmt
+            printf '%s\n' "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          tmt --version
+
+          # RHEL ships virtiofsd below /usr/libexec, while bcvk and libvirt
+          # commonly discover it through PATH.
+          virtiofsd_path=$(rpm -ql virtiofsd | awk '/\/virtiofsd$/ { print; exit }')
+          test -n "$virtiofsd_path"
+          sudo ln -sfn "$virtiofsd_path" /usr/local/bin/virtiofsd
+
+          # RHEL's edk2 package also advertises an AMD SEV firmware descriptor.
+          # bcvk requests ordinary insecure UEFI; disable only that descriptor
+          # on this disposable host so libvirt does not select SEV firmware for
+          # a plain KVM guest.
+          for firmware in /usr/share/qemu/firmware/*amdsev*.json; do
+            [ -e "$firmware" ] || continue
+            sudo mv "$firmware" "${firmware}.disabled"
+          done
+
+          # Prefer the unprivileged session daemon.  Grant only this disposable
+          # job user access to KVM; do not change SELinux mode or use rootful
+          # libvirt as a fallback.
+          if [ -c /dev/kvm ]; then
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+          fi
+          {
+            printf 'LIBVIRT_DEFAULT_URI=qemu:///session\n'
+            printf 'LIBVIRT_DEBUG=1\n'
+            printf 'LIBVIRT_LOG_FILTERS=1:libvirt 1:qemu 1:util\n'
+            printf 'LIBVIRT_LOG_OUTPUTS=1:file:%s/libvirt.log\n' \
+              "$GITHUB_WORKSPACE/target/run/tmt-rhel10"
+            printf 'TMT_LOG_DIR=%s\n' "$GITHUB_WORKSPACE/target/run/tmt-rhel10"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/target/run/tmt-rhel10"
+
+      - name: Verify RHEL session virtualization
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          printf '%s\n' '--- KVM, CPU, permissions, firmware, and virtiofsd ---'
+          id
+          groups
+          stat -c '%A %U:%G %n' /dev/kvm 2>&1 || true
+          test -r /dev/kvm && test -w /dev/kvm
+          lscpu | grep -E 'Architecture|Virtualization|Hypervisor' || true
+          command -v virtiofsd
+          find /usr/share -iname '*OVMF*' -o -iname '*edk2*' 2>/dev/null | sort
+          getenforce
+          printf '%s\n' '--- user runtime and session DBus ---'
+          printf 'XDG_RUNTIME_DIR=%s\n' "${XDG_RUNTIME_DIR:-unset}"
+          test -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+          dbus-run-session -- bash -ceu '
+            export LIBVIRT_DEFAULT_URI=qemu:///session
+            if ! systemctl --user start virtqemud.socket virtlogd.socket; then
+              echo "No user socket units; starting unprivileged session daemons directly"
+              virtqemud --timeout 0 >/tmp/virtqemud.log 2>&1 &
+              virtlogd --timeout 0 >/tmp/virtlogd.log 2>&1 &
+              sleep 2
+            fi
+            virsh uri
+            virsh list --all
+          '
+
       - name: Collect host diagnostics
         run: |
           set +e
@@ -101,6 +245,171 @@ jobs:
           '
           BOOTC_jobs=8 just test-container-integration
 
+      - name: Run bounded QEMU and libvirt preflight
+        timeout-minutes: 15
+        run: |
+          set +e
+          preflight="$GITHUB_WORKSPACE/target/run/tmt-rhel10/preflight"
+          mkdir -p "$preflight"
+          uri=qemu:///session
+          qemu_bin=$(command -v qemu-system-x86_64 || command -v qemu-kvm || printf '%s' /usr/libexec/qemu-kvm)
+          printf 'QEMU binary: %s\n' "$qemu_bin" | tee "$preflight/qemu-version.txt"
+          "$qemu_bin" --version >>"$preflight/qemu-version.txt" 2>&1
+          lscpu >"$preflight/lscpu.txt" 2>&1
+          stat -c '%A %U:%G %n' /dev/kvm >"$preflight/kvm.txt" 2>&1
+
+          run_qemu_smoke() {
+            local label=$1 cpu=$2 pid rc
+            local stderr="$preflight/qemu-${label}.stderr"
+            local stdout="$preflight/qemu-${label}.stdout"
+            printf '\n=== direct QEMU smoke: %s (%s) ===\n' "$label" "$cpu" | tee -a "$preflight/boundaries.txt"
+            "$qemu_bin" -accel kvm -nodefaults -display none -monitor none \
+              -serial none -no-reboot -S -cpu "$cpu" >"$stdout" 2>"$stderr" &
+            pid=$!
+            sleep 2
+            if kill -0 "$pid" 2>/dev/null; then
+              printf 'PASS: process stayed alive with KVM and -cpu %s\n' "$cpu" | tee -a "$preflight/boundaries.txt"
+              kill "$pid" 2>/dev/null
+              wait "$pid" 2>/dev/null
+            else
+              wait "$pid"; rc=$?
+              printf 'FAIL: QEMU exited before monitor probe, rc=%s\n' "$rc" | tee -a "$preflight/boundaries.txt"
+            fi
+            cat "$stderr"
+          }
+          run_qemu_smoke conservative qemu64
+          run_qemu_smoke host host
+
+          start_domain() {
+            local name=$1 xml=$2 log="$preflight/$1.virsh.log"
+            printf '\n=== libvirt boundary: %s ===\n' "$name" | tee -a "$preflight/boundaries.txt"
+            virsh -c "$uri" define "$xml" >"$log" 2>&1
+            virsh -c "$uri" dumpxml "$name" >"$preflight/$name.before-start.xml" 2>>"$log"
+            virsh -c "$uri" start "$name" >>"$log" 2>&1
+            sleep 3
+            virsh -c "$uri" domstate "$name" >>"$log" 2>&1
+            virsh -c "$uri" dumpxml "$name" >"$preflight/$name.after-start.xml" 2>>"$log"
+            if virsh -c "$uri" domstate "$name" | grep -q running; then
+              printf 'PASS: domain reached running\n' | tee -a "$preflight/boundaries.txt"
+            else
+              printf 'FAIL: domain did not reach running; see %s\n' "$log" | tee -a "$preflight/boundaries.txt"
+            fi
+            virsh -c "$uri" destroy "$name" >>"$log" 2>&1
+            virsh -c "$uri" undefine "$name" --nvram --remove-all-storage >>"$log" 2>&1
+          }
+
+          cat >"$preflight/minimal.xml" <<'EOF'
+          <domain type='kvm'>
+            <name>bootc-preflight-minimal</name><memory unit='MiB'>256</memory><vcpu>1</vcpu>
+            <os><type arch='x86_64' machine='q35'>hvm</type></os>
+            <features><acpi/><apic/></features>
+            <cpu mode='custom' match='exact'><model fallback='allow'>qemu64</model></cpu>
+            <devices><emulator>/usr/libexec/qemu-kvm</emulator></devices>
+          </domain>
+          EOF
+          start_domain bootc-preflight-minimal "$preflight/minimal.xml"
+
+          disk="$preflight/feature.qcow2"
+          nvram="$preflight/feature-vars.fd"
+          qemu-img create -f qcow2 "$disk" 64M >"$preflight/qemu-img.log" 2>&1
+          cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$nvram" 2>/dev/null || \
+            cp /usr/share/OVMF/OVMF_VARS.fd "$nvram"
+          loader=/usr/share/edk2/ovmf/OVMF_CODE.fd
+          [ -r "$loader" ] || loader=/usr/share/OVMF/OVMF_CODE.fd
+          cat >"$preflight/features.xml" <<EOF
+          <domain type='kvm'>
+          <name>bootc-preflight-features</name><memory unit='MiB'>4096</memory><vcpu>2</vcpu>
+            <os><type arch='x86_64' machine='q35'>hvm</type><loader readonly='yes' type='pflash'>$loader</loader><nvram>$nvram</nvram></os>
+          <features><acpi/><apic/></features><cpu mode='host-passthrough'/>
+          <memoryBacking><source type='memfd'/><access mode='shared'/></memoryBacking>
+            <devices><emulator>/usr/libexec/qemu-kvm</emulator>
+            <disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='$disk'/><target dev='vda' bus='virtio'/></disk>
+            <interface type='user'><model type='virtio'/></interface>
+              <tpm model='tpm-crb'><backend type='emulator' version='2.0'/></tpm>
+              <filesystem type='mount' accessmode='passthrough'><driver type='virtiofs'/><source dir='$preflight'/><target dir='preflight'/></filesystem>
+            </devices>
+          </domain>
+          EOF
+          start_domain bootc-preflight-features "$preflight/features.xml"
+          virsh -c "$uri" list --all >"$preflight/virsh-list.txt" 2>&1
+          timeout 30s coredumpctl list --no-pager -n 20 >"$preflight/coredumps.txt" 2>&1
+          timeout 30s ausearch -m avc -ts recent >"$preflight/selinux-avc.txt" 2>&1
+          # Preflight records boundaries; the repository TMT test is the
+          # authoritative result and must still run after a probe failure.
+          exit 0
+
+      - name: Run TMT readonly VM test
+        timeout-minutes: 120
+        run: |
+          set -euo pipefail
+          # The repository-defined equivalent of the requested readonly test
+          # is `just test-tmt readonly`; it builds the upgrade image and then
+          # runs the readonly plan through cargo xtask and bcvk.
+          runtime_dir=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          export LIBVIRT_DEFAULT_URI=qemu:///session
+          mkdir -p "$TMT_LOG_DIR"
+          if ! systemctl --user start virtqemud.socket virtlogd.socket; then
+            echo "No user socket units; starting unprivileged session daemons directly"
+            virtqemud --timeout 0 >/tmp/virtqemud-tmt.log 2>&1 &
+            virtlogd --timeout 0 >/tmp/virtlogd-tmt.log 2>&1 &
+            sleep 2
+          fi
+          virsh uri
+          # Do not leave the diagnostic dbus-run-session environment attached
+          # to Podman: crun interprets it as a request for a systemd cgroup and
+          # fails when this GitHub runner has no user systemd manager.
+          unset DBUS_SESSION_BUS_ADDRESS
+          timeout --foreground --signal=TERM --kill-after=60s 100m \
+            env BOOTC_jobs=8 just test-tmt readonly
+
+      - name: Collect VM and TMT diagnostics
+        if: always()
+        run: |
+          set +e
+          printf '%s\n' '--- VM/KVM/session diagnostics ---'
+          id; groups
+          stat -c '%A %U:%G %n' /dev/kvm 2>&1
+          lscpu 2>&1 | grep -E 'Architecture|Virtualization|Hypervisor|Flags'
+          getenforce 2>&1
+          timeout 30s virsh -c qemu:///session list --all 2>&1
+          timeout 30s bcvk libvirt list 2>&1
+          timeout 30s systemctl --user --no-pager status virtqemud.socket virtlogd.socket 2>&1
+          timeout 30s journalctl --user -u virtqemud -u virtlogd --no-pager -n 200 2>&1
+          for log in /tmp/virtqemud*.log /tmp/virtlogd*.log; do
+            [ -e "$log" ] || continue
+            printf '\n--- %s ---\n' "$log"
+            timeout 30s tail -n 200 "$log"
+          done
+          for log in "$HOME"/.local/share/libvirt/qemu/log/*.log "$HOME"/.cache/libvirt/qemu/log/*.log; do
+            [ -e "$log" ] || continue
+            printf '\n--- %s ---\n' "$log"
+            timeout 30s tail -n 200 "$log"
+          done
+          printf '%s\n' '--- failed units, disk, and TMT artifacts ---'
+          timeout 30s systemctl --failed --no-pager 2>&1
+          timeout 30s df -h / /var/tmp 2>&1
+          timeout 30s du -sh target/run/tmt-rhel10 target 2>&1
+          printf '%s\n' 'TMT artifact files:'
+          find target/run/tmt-rhel10 -maxdepth 4 -type f -printf '%p %s bytes\n' 2>&1 | sort
+          while IFS= read -r -d '' log; do
+            printf '\n--- %s (last 200 lines) ---\n' "$log"
+            timeout 30s tail -n 200 "$log"
+          done < <(find target/run/tmt-rhel10 -type f \( -name '*.log' -o -name 'output.txt' \) -print0 2>/dev/null)
+
+      - name: Upload VM and TMT diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhel10-vm-diagnostics
+          path: |
+            target/run/tmt-rhel10
+            /tmp/virtqemud*.log
+            /tmp/virtlogd*.log
+            /home/runner/.cache/libvirt/qemu/log/*.log
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Always collect diagnostics and clean rootless storage
         if: always()
         run: |
@@ -114,6 +423,19 @@ jobs:
           timeout 30s df -h / /var/tmp 2>&1 || true
           printf '%s\n' '--- failed system units ---'
           timeout 30s systemctl --failed --no-pager 2>&1 || true
+          printf '%s\n' '--- remove only domains created by this job ---'
+          while IFS= read -r name; do
+            case "$name" in
+              bootc-tmt-*)
+                timeout 60s bcvk libvirt rm --stop --force "$name" 2>&1 || true
+                ;;
+              bootc-preflight-*)
+                timeout 30s virsh -c qemu:///session destroy "$name" 2>&1 || true
+                timeout 30s virsh -c qemu:///session undefine "$name" --nvram --remove-all-storage 2>&1 || true
+                ;;
+            esac
+          done < <(virsh -c qemu:///session list --all --name 2>/dev/null)
+          timeout 30s virsh -c qemu:///session list --all 2>&1 || true
           printf '%s\n' '--- remove containers and reclaim unused rootless storage ---'
           timeout 60s podman rm --all --force 2>&1 || true
           timeout 180s podman system prune --all --force --volumes 2>&1 || true
