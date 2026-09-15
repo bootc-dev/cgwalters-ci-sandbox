@@ -39,8 +39,6 @@ Any additional arguments after `--` are passed through to ukify unchanged.
     - v1
     - v2
 
-    Default: v1
-
 **--write-dumpfile-to**=*WRITE_DUMPFILE_TO*
 
     Write a dumpfile to this path
