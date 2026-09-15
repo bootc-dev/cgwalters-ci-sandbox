@@ -131,6 +131,16 @@ pub(crate) async fn initialize_composefs_repository(
 
     crate::store::ensure_composefs_dir(rootfs_dir)?;
 
+    // Ensure the compatibility symlink ostree/bootc -> ../composefs/bootc
+    // exists.  This is needed for LBI and (when unified storage is enabled)
+    // for containers-storage under composefs/bootc/storage.  The existing
+    // /usr/lib/bootc/storage symlink and all runtime code using
+    // ostree/bootc/storage depend on this link.
+    crate::store::ensure_composefs_bootc_link(
+        rootfs_dir,
+        crate::store::ComposefsBootcLinkPolicy::FreshInstall,
+    )?;
+
     let config = composefs_repository_config(allow_missing_fsverity);
     let (mut repo, _created) =
         crate::store::ComposefsRepository::init_path(rootfs_dir, "composefs", config)
@@ -150,13 +160,6 @@ pub(crate) async fn initialize_composefs_repository(
         .as_str()
         .try_into()
         .context("Parsing source image reference")?;
-
-    // Ensure the compatibility symlink ostree/bootc -> ../composefs/bootc
-    // exists.  This is needed for LBI and (when unified storage is enabled)
-    // for containers-storage under composefs/bootc/storage.  The existing
-    // /usr/lib/bootc/storage symlink and all runtime code using
-    // ostree/bootc/storage depend on this link.
-    crate::store::ensure_composefs_bootc_link(rootfs_dir)?;
 
     let repo = Arc::new(repo);
 
@@ -370,6 +373,14 @@ pub(crate) async fn pull_composefs_repo(
     );
 
     let rootfs_dir = Dir::open_ambient_dir("/sysroot", ambient_authority())?;
+
+    // An older native installation may predate the compatibility link.  This
+    // is a writable upgrade path, so repair a missing expected link here;
+    // refuse foreign or user-owned paths rather than replacing them.
+    crate::store::ensure_composefs_bootc_link(
+        &rootfs_dir,
+        crate::store::ComposefsBootcLinkPolicy::ExistingNative,
+    )?;
 
     let mut repo = open_composefs_repo(&rootfs_dir).context("Opening composefs repo")?;
     if allow_missing_fsverity {

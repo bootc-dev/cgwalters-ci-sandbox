@@ -172,6 +172,16 @@ pub(crate) const BOOTC_ROOT: &str = "ostree/bootc";
 /// physical system root.
 pub(crate) const COMPOSEFS_BOOTC_ROOT: &str = "composefs/bootc";
 
+/// Whether a composefs operation is creating a new target or updating a
+/// native target created by an older bootc.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ComposefsBootcLinkPolicy {
+    /// A fresh install must use composefs-backed bootc storage.
+    FreshInstall,
+    /// An existing native system may retain legacy ostree/bootc storage.
+    ExistingNative,
+}
+
 /// On a composefs install the containers-storage lives under
 /// `composefs/bootc/storage`.  To keep the rest of the code (and the
 /// `/usr/lib/bootc/storage` symlink which points through `ostree/bootc`)
@@ -179,39 +189,68 @@ pub(crate) const COMPOSEFS_BOOTC_ROOT: &str = "composefs/bootc";
 ///
 ///   `ostree/bootc -> ../composefs/bootc`
 ///
-/// This function is idempotent.
-pub(crate) fn ensure_composefs_bootc_link(physical_root: &Dir) -> Result<()> {
-    // Ensure the real directory exists
+/// This function is idempotent for the expected link. A fresh install refuses
+/// an existing bootc directory. An existing native system retains a real
+/// legacy directory, avoiding a storage migration or user-data replacement.
+pub(crate) fn ensure_composefs_bootc_link(
+    physical_root: &Dir,
+    policy: ComposefsBootcLinkPolicy,
+) -> Result<()> {
+    // Do not let the parent escape the target while creating the compatibility
+    // namespace. A symlink here would make create_dir_all() write outside the
+    // physical root.
+    match physical_root.symlink_metadata("ostree") {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(meta) if meta.is_symlink() => {
+            anyhow::bail!("Refusing symlinked ostree compatibility parent")
+        }
+        Ok(_) => anyhow::bail!("Refusing non-directory ostree compatibility parent"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => physical_root
+            .create_dir("ostree")
+            .context("Creating ostree directory")?,
+        Err(e) => return Err(e).context("Querying ostree compatibility parent"),
+    }
+
+    // Accept only the exact relative compatibility link.  Do not replace a
+    // foreign link that could contain user-owned state.
+    let create_link = match physical_root.symlink_metadata(BOOTC_ROOT) {
+        Ok(meta) if meta.is_symlink() => {
+            let expected = format!("../{COMPOSEFS_BOOTC_ROOT}");
+            let target = physical_root
+                .read_link_contents(BOOTC_ROOT)
+                .with_context(|| format!("Reading {BOOTC_ROOT}"))?;
+            if target != std::path::Path::new(&expected) {
+                anyhow::bail!(
+                    "Refusing to replace unexpected {BOOTC_ROOT} symlink target {target:?}; expected {expected:?}"
+                );
+            }
+            false
+        }
+        Ok(meta) if meta.is_dir() => match policy {
+            ComposefsBootcLinkPolicy::FreshInstall => anyhow::bail!(
+                "Refusing existing legacy {BOOTC_ROOT} during a fresh composefs install"
+            ),
+            ComposefsBootcLinkPolicy::ExistingNative => return Ok(()),
+        },
+        Ok(_) => {
+            anyhow::bail!("Refusing existing non-directory {BOOTC_ROOT}");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Good — doesn't exist yet, we'll create the symlink
+            true
+        }
+        Err(e) => return Err(e).context(format!("Querying {BOOTC_ROOT}")),
+    };
+
+    // Ensure the real directory exists only after rejecting a foreign path,
+    // so an invalid compatibility namespace does not otherwise mutate the
+    // target.
     physical_root
         .create_dir_all(COMPOSEFS_BOOTC_ROOT)
         .with_context(|| format!("Creating {COMPOSEFS_BOOTC_ROOT}"))?;
 
-    // Create the `ostree/` parent if needed (it won't exist on a pure
-    // composefs install that never touched ostree).
-    physical_root
-        .create_dir_all("ostree")
-        .context("Creating ostree directory")?;
-
-    // If ostree/bootc already exists as a real directory (e.g. from an
-    // older install or from the ostree path), leave it alone — this
-    // function is only for fresh composefs installs.
-    match physical_root.symlink_metadata(BOOTC_ROOT) {
-        Ok(meta) if meta.is_symlink() => {
-            // Already a symlink — nothing to do
-            return Ok(());
-        }
-        Ok(_meta) => {
-            // It's a real directory.  This shouldn't happen during a fresh
-            // composefs install, but if it does just leave it.
-            tracing::warn!(
-                "{BOOTC_ROOT} already exists as a directory, not replacing with symlink"
-            );
-            return Ok(());
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Good — doesn't exist yet, we'll create the symlink
-        }
-        Err(e) => return Err(e).context(format!("Querying {BOOTC_ROOT}")),
+    if !create_link {
+        return Ok(());
     }
 
     physical_root
@@ -494,6 +533,35 @@ impl BootedStorage {
             }))
         }
     }
+
+    /// Repair the composefs compatibility namespace before a writable caller
+    /// can probe containers-storage. Read-only status construction does not
+    /// call this method.
+    pub(crate) fn prepare_for_write(&self) -> Result<()> {
+        self.require_writable()?;
+        if self.composefs.get().is_some() {
+            ensure_composefs_bootc_link(
+                &self.physical_root,
+                ComposefsBootcLinkPolicy::ExistingNative,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Run a containers-storage operation after repairing the native composefs
+/// compatibility path. This is a defense for callers that access CStorage
+/// after `get_storage()`; the central writable-storage preparation remains the
+/// primary ordering guarantee.
+fn with_composefs_cstorage_path<T>(
+    physical_root: &Dir,
+    is_composefs: bool,
+    probe: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    if is_composefs {
+        ensure_composefs_bootc_link(physical_root, ComposefsBootcLinkPolicy::ExistingNative)?;
+    }
+    probe()
 }
 
 /// A reference to a physical filesystem root, plus
@@ -681,7 +749,11 @@ impl Storage {
 
         tracing::trace!("sepolicy in get_ensure_imgstore: {sepolicy:?}");
 
-        let imgstore = CStorage::create(&sysroot_dir, &self.run, sepolicy.as_ref())?;
+        let imgstore = with_composefs_cstorage_path(
+            &self.physical_root,
+            self.composefs.get().is_some(),
+            || CStorage::create(&sysroot_dir, &self.run, sepolicy.as_ref()),
+        )?;
         Ok(self.imgstore.get_or_init(|| imgstore))
     }
 
@@ -834,6 +906,108 @@ mod tests {
         let perms = td.metadata(COMPOSEFS)?.permissions();
         let mode = Mode::from_raw_mode(perms.mode());
         assert_eq!(mode & PERMS, COMPOSEFS_MODE);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ensure_composefs_bootc_link() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        let expected = format!("../{COMPOSEFS_BOOTC_ROOT}");
+
+        // A fresh target gets both the native directory and compatibility link.
+        ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::FreshInstall)?;
+        assert_eq!(
+            td.read_link_contents(BOOTC_ROOT)?,
+            std::path::Path::new(&expected)
+        );
+        assert!(td.try_exists(COMPOSEFS_BOOTC_ROOT)?);
+
+        // The expected link is idempotent and writes through to native storage.
+        ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::FreshInstall)?;
+        td.create_dir_all(format!("{BOOTC_ROOT}/storage"))?;
+        td.write(format!("{BOOTC_ROOT}/storage/probe"), b"native")?;
+        assert_eq!(
+            td.read_to_string(format!("{COMPOSEFS_BOOTC_ROOT}/storage/probe"))?,
+            "native"
+        );
+
+        // A missing link is repaired during a writable installation path.
+        td.remove_file(BOOTC_ROOT)?;
+        ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::ExistingNative)?;
+        assert_eq!(
+            td.read_link_contents(BOOTC_ROOT)?,
+            std::path::Path::new(&expected)
+        );
+
+        // Never replace a foreign link or a real user-owned directory.
+        td.remove_file(BOOTC_ROOT)?;
+        td.symlink_contents("../foreign", BOOTC_ROOT)?;
+        assert!(
+            ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::ExistingNative).is_err()
+        );
+        assert_eq!(
+            td.read_link_contents(BOOTC_ROOT)?,
+            std::path::Path::new("../foreign")
+        );
+
+        td.remove_file(BOOTC_ROOT)?;
+        td.create_dir_all(BOOTC_ROOT)?;
+        td.write(format!("{BOOTC_ROOT}/user-data"), b"keep")?;
+        assert!(ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::FreshInstall).is_err());
+        assert_eq!(
+            td.read_to_string(format!("{BOOTC_ROOT}/user-data"))?,
+            "keep"
+        );
+
+        // An existing native system reuses its pre-link legacy storage.
+        ensure_composefs_bootc_link(&td, ComposefsBootcLinkPolicy::ExistingNative)?;
+        assert!(td.symlink_metadata(BOOTC_ROOT)?.is_dir());
+        assert_eq!(
+            td.read_to_string(format!("{BOOTC_ROOT}/user-data"))?,
+            "keep"
+        );
+
+        // A symlinked parent must not redirect writes outside the target.
+        let escaped = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+        escaped.create_dir("outside")?;
+        escaped.write("outside/sentinel", b"unchanged")?;
+        escaped.symlink_contents("outside", "ostree")?;
+        assert!(
+            ensure_composefs_bootc_link(&escaped, ComposefsBootcLinkPolicy::FreshInstall).is_err()
+        );
+        assert!(!escaped.try_exists("outside/bootc")?);
+        assert_eq!(escaped.read_to_string("outside/sentinel")?, "unchanged");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_composefs_cstorage_probe_repairs_link_first() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+
+        with_composefs_cstorage_path(&td, true, || {
+            // This represents CStorage::create()'s first path probe. It must
+            // see the native compatibility link, not create a legacy path.
+            assert!(td.symlink_metadata(BOOTC_ROOT)?.is_symlink());
+            td.create_dir_all(crate::podstorage::CStorage::subpath())?;
+            Ok(())
+        })?;
+        assert!(td.try_exists("composefs/bootc/storage")?);
+        assert!(td.symlink_metadata(BOOTC_ROOT)?.is_symlink());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_composefs_cstorage_probe_does_not_repair_link() -> Result<()> {
+        let td = cap_std_ext::cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+
+        with_composefs_cstorage_path(&td, false, || {
+            assert!(td.symlink_metadata(BOOTC_ROOT).is_err());
+            Ok(())
+        })?;
+        assert!(td.symlink_metadata(BOOTC_ROOT).is_err());
 
         Ok(())
     }

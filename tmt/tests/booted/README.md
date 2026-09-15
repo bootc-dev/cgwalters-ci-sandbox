@@ -32,6 +32,7 @@ cargo xtask run-tmt "$BOOTC_1160_STAGER_IMAGE" composefs-1-16-bridge \
   --composefs-backend --bootloader systemd --boot-type uki --seal-state sealed \
   --context composefs_bridge=true \
   --env BOOTC_composefs_bridge_mode=old-stager \
+  --env BOOTC_bridge_store_layout=default \
   --env BOOTC_1160_bootc_sha256="$BOOTC_1160_BOOTC_SHA256" \
   --bridge-image "$BOOTC_CURRENT_DUAL_UKI_IMAGE" \
   --upgrade-image "$BOOTC_CURRENT_DUAL_UKI_UPGRADE_IMAGE"
@@ -52,6 +53,20 @@ For the old-stager case it also supplies the required
 `BOOTC_1160_BOOTC_SHA256` value from the pinned fixture build; the test records
 the exact `bootc --version`, RPM NEVRA, and `/usr/bin/bootc` checksum before it
 stages the bridge image.
+
+`BOOTC_bridge_store_layout` is opt-in and applies only to `old-stager`:
+`default` leaves the guest unchanged, `legacy-dir` models the historical real
+`/sysroot/ostree/bootc` directory, and `missing-link` removes only the exact
+native compatibility link after the first current-client boot.  Both mutation
+cases require a disposable native-composefs VM, a writable physical `/sysroot`,
+and a fixture with at least one logical image. `legacy-dir` uses the 1.16.0
+supported `bootc image cmd pull` interface and records local config IDs. It
+stages the current bridge first, then creates the historical real store with
+the checksum-verified 1.16 client: old 1.16 staging can prune its LBI store, so
+this is current-client retention coverage and does not claim old-client GC
+preserves LBIs. On the first current-client boot the test requires exactly the
+three shared fixture LBIs and records their full local config IDs before the
+next staged reboot; IDs may legitimately refresh later.
 
 The test checks the public status schema, `/proc/cmdline`, repository image
 and deployment-state directories, and `/etc` and `/var` sentinels. There is no

@@ -245,12 +245,31 @@ impl CStorage {
     /// idempotence.
     #[context("Labeling imgstorage dirs")]
     pub(crate) fn ensure_labeled(&self) -> Result<()> {
-        if self.storage_root.try_exists(LABELED)? {
+        self.ensure_labeled_impl(false)
+    }
+
+    /// Label storage after install-wide relabeling has completed.
+    ///
+    /// Unlike [`Self::ensure_labeled`], this intentionally invalidates the
+    /// stamp: composefs installation first labels the repository as `/usr`,
+    /// which can overwrite containers-storage labels written earlier.
+    #[context("Final install labeling of imgstorage dirs")]
+    pub(crate) fn ensure_labeled_for_install(&self) -> Result<()> {
+        self.ensure_labeled_impl(true)
+    }
+
+    fn ensure_labeled_impl(&self, force: bool) -> Result<()> {
+        if !force && self.storage_root.try_exists(LABELED)? {
             return Ok(());
         }
         let Some(sepolicy) = self.sepolicy.as_ref() else {
             return Ok(());
         };
+        if force {
+            // Preserve the normal booted-system fast path while making an
+            // install's final label pass authoritative.
+            self.storage_root.remove_file_optional(LABELED)?;
+        }
 
         // recursively set the labels because they were previously set to usr_t,
         // and there is no policy defined to set them to the c/storage labels

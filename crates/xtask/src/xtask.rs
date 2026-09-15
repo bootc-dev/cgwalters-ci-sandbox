@@ -836,7 +836,7 @@ mod tests {
             "--libvirt-connect",
             "qemu+unix:///session?socket=/run/user/UID/libvirt/virtqemud-sock",
             "localhost/bootc",
-            "status-fresh-install",
+            "native-lbi-fresh-install",
         ])
         .unwrap();
         let Commands::RunTmt(args) = cli.command else {

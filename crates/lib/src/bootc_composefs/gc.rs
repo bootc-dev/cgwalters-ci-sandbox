@@ -5,6 +5,8 @@
 //! - We delete bootloader + image but fail to delete the state/unrefenced objects etc
 
 use anyhow::{Context, Result};
+use bootc_initramfs_setup::mount_composefs_image;
+use bootc_mount::tempmount::TempMount;
 use cap_std_ext::{cap_std::fs::Dir, dirext::CapStdExtDirExt};
 use composefs::fsverity::FsVerityHashValue;
 use composefs::repository::GcResult;
@@ -31,6 +33,81 @@ use crate::{
     },
     store::{BootedComposefs, Storage},
 };
+
+#[derive(Debug)]
+struct LiveComposefsDeployment {
+    verity: String,
+    missing_verity_allowed: bool,
+}
+
+/// Query bound images from every live immutable deployment.  The caller must
+/// not prune containers-storage if this fails: partial roots could delete an
+/// image needed by a deployment we could not inspect.
+fn collect_live_bound_image_roots(
+    deployments: &[LiveComposefsDeployment],
+    mut query: impl FnMut(&LiveComposefsDeployment) -> Result<Vec<crate::boundimage::BoundImage>>,
+) -> Result<std::collections::HashSet<String>> {
+    let mut roots = std::collections::HashSet::new();
+    for deployment in deployments {
+        let images = query(deployment).with_context(|| {
+            format!("Querying bound images for deployment {}", deployment.verity)
+        })?;
+        roots.extend(images.into_iter().map(|image| image.image));
+    }
+    Ok(roots)
+}
+
+fn query_live_bound_images(
+    sysroot: &Dir,
+    deployments: &[LiveComposefsDeployment],
+) -> Result<std::collections::HashSet<String>> {
+    let sysroot_fd = sysroot.reopen_as_ownedfd()?;
+    collect_live_bound_image_roots(deployments, |deployment| {
+        let image = mount_composefs_image(
+            &sysroot_fd,
+            &deployment.verity,
+            deployment.missing_verity_allowed,
+        )
+        .with_context(|| format!("Mounting deployment {}", deployment.verity))?;
+        let mount = TempMount::mount_fd(&image)
+            .with_context(|| format!("Opening deployment {}", deployment.verity))?;
+        crate::boundimage::query_bound_images(&mount.fd)
+    })
+}
+
+fn deployment_is_live(verity: &str, all_orphans: &[&String]) -> bool {
+    !all_orphans.iter().any(|orphan| orphan.as_str() == verity)
+}
+
+/// Select deployment mount policy for CStorage root discovery.
+///
+/// Status currently fills every entry's `missing_verity_allowed` from the
+/// booted command line, so it is not trustworthy for non-booted deployments.
+/// Mounting those deployments strictly is conservative: a deployment that
+/// cannot be inspected disables CStorage pruning rather than risking an LBI
+/// deletion. Per-deployment boot-policy resolution can relax this when it is
+/// reliably recorded.
+fn live_deployments_from_status(
+    host: &crate::spec::Host,
+    all_orphans: &[&String],
+    booted_verity: &str,
+    booted_missing_verity_allowed: bool,
+) -> Result<Vec<LiveComposefsDeployment>> {
+    let mut deployments = Vec::new();
+    for deployment in host.list_deployments() {
+        let composefs = deployment.require_composefs()?;
+        if deployment_is_live(&composefs.verity, all_orphans) {
+            deployments.push(LiveComposefsDeployment {
+                verity: composefs.verity.clone(),
+                // Do not use composefs.missing_verity_allowed here; status
+                // currently copies the booted policy into every entry.
+                missing_verity_allowed: composefs.verity == booted_verity
+                    && booted_missing_verity_allowed,
+            });
+        }
+    }
+    Ok(deployments)
+}
 
 #[fn_error_context::context("Listing state directories")]
 fn list_state_dirs(sysroot: &Dir) -> Result<Vec<String>> {
@@ -367,6 +444,12 @@ pub(crate) async fn composefs_gc(
     let mut additional_roots = Vec::new();
     // Container image names for containers-storage pruning.
     let mut live_container_images: std::collections::HashSet<String> = Default::default();
+    let live_deployments = live_deployments_from_status(
+        &host,
+        &all_orphans,
+        &booted_cfs_status.verity,
+        booted_cfs.cmdline.allow_missing_fsverity,
+    )?;
 
     // Read existing tags before the deployment loop so we can search
     // them for deployments that lack manifest_digest in their origin.
@@ -377,7 +460,7 @@ pub(crate) async fn composefs_gc(
         let verity = &deployment.require_composefs()?.verity;
 
         // Skip deployments that are already being GC'd.
-        if all_orphans.contains(&verity) {
+        if !deployment_is_live(verity, &all_orphans) {
             continue;
         }
 
@@ -484,17 +567,35 @@ pub(crate) async fn composefs_gc(
         .map(|x| x.as_str())
         .collect::<Vec<_>>();
 
-    // Prune containers-storage: remove images not backing any live deployment.
-    if !gc_opts.dry_run && !live_container_images.is_empty() {
+    // Prune containers-storage only after every live immutable deployment has
+    // contributed its bound-image roots.  If any deployment cannot be mounted
+    // or parsed, preserve all CStorage images rather than pruning from a
+    // partial root set. Other composefs repository GC may still proceed.
+    if !gc_opts.dry_run {
         let subpath = crate::podstorage::CStorage::subpath();
-        if sysroot.try_exists(&subpath).unwrap_or(false) {
-            let run = Dir::open_ambient_dir("/run", cap_std_ext::cap_std::ambient_authority())?;
-            let imgstore = crate::podstorage::CStorage::create(&sysroot, &run, None)?;
-            let roots: std::collections::HashSet<&str> =
-                live_container_images.iter().map(|s| s.as_str()).collect();
-            let pruned = imgstore.prune_except_roots(&roots).await?;
-            if !pruned.is_empty() {
-                tracing::info!("Pruned {} images from containers-storage", pruned.len());
+        if sysroot.try_exists(&subpath)? {
+            let bound_image_roots = match query_live_bound_images(sysroot, &live_deployments) {
+                Ok(bound_image_roots) => Some(bound_image_roots),
+                Err(e) => {
+                    tracing::warn!(
+                        "Skipping containers-storage pruning because live bound images could not be queried: {e:#}"
+                    );
+                    None
+                }
+            };
+            if let Some(bound_image_roots) = bound_image_roots {
+                live_container_images.extend(bound_image_roots);
+                if !live_container_images.is_empty() {
+                    let run =
+                        Dir::open_ambient_dir("/run", cap_std_ext::cap_std::ambient_authority())?;
+                    let imgstore = crate::podstorage::CStorage::create(&sysroot, &run, None)?;
+                    let roots: std::collections::HashSet<&str> =
+                        live_container_images.iter().map(|s| s.as_str()).collect();
+                    let pruned = imgstore.prune_except_roots(&roots).await?;
+                    if !pruned.is_empty() {
+                        tracing::info!("Pruned {} images from containers-storage", pruned.len());
+                    }
+                }
             }
         }
     }
@@ -601,7 +702,28 @@ pub(crate) async fn composefs_gc(
 mod tests {
     use super::*;
     use crate::bootc_composefs::status::list_type1_entries;
+    use crate::spec::{BootEntry, BootEntryComposefs, Bootloader, Host};
     use crate::testutils::{ChangeType, TestRoot};
+
+    fn composefs_entry(verity: &str, reported_missing_verity_allowed: bool) -> BootEntry {
+        BootEntry {
+            image: None,
+            cached_update: None,
+            incompatible: false,
+            pinned: false,
+            soft_reboot_capable: false,
+            download_only: false,
+            store: None,
+            ostree: None,
+            composefs: Some(BootEntryComposefs {
+                verity: verity.into(),
+                boot_type: BootType::Bls,
+                bootloader: Bootloader::Systemd,
+                boot_digest: None,
+                missing_verity_allowed: reported_missing_verity_allowed,
+            }),
+        }
+    }
 
     #[test]
     fn test_image_refs_match_v2_when_v1_is_present() {
@@ -609,6 +731,121 @@ mod tests {
         let v2 = composefs::fsverity::Sha512HashValue::from_hex(&"22".repeat(64)).unwrap();
 
         assert!(image_refs_match(Some(&v1), Some(&v2), &v2.to_hex()));
+    }
+
+    #[test]
+    fn test_collect_live_bound_image_roots_all_slots() -> Result<()> {
+        let deployments = [
+            LiveComposefsDeployment {
+                verity: "booted".into(),
+                missing_verity_allowed: false,
+            },
+            LiveComposefsDeployment {
+                verity: "staged".into(),
+                missing_verity_allowed: true,
+            },
+            LiveComposefsDeployment {
+                verity: "rollback".into(),
+                missing_verity_allowed: false,
+            },
+            LiveComposefsDeployment {
+                verity: "pinned".into(),
+                missing_verity_allowed: true,
+            },
+        ];
+        let mut queried = Vec::new();
+
+        let roots = collect_live_bound_image_roots(&deployments, |deployment| {
+            queried.push((deployment.verity.clone(), deployment.missing_verity_allowed));
+            Ok(vec![crate::boundimage::BoundImage {
+                image: format!("registry.example/{}:latest", deployment.verity),
+                auth_file: None,
+            }])
+        })?;
+
+        assert_eq!(
+            queried,
+            vec![
+                ("booted".into(), false),
+                ("staged".into(), true),
+                ("rollback".into(), false),
+                ("pinned".into(), true),
+            ]
+        );
+        assert_eq!(roots.len(), deployments.len());
+        assert!(roots.contains("registry.example/pinned:latest"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_collect_live_bound_image_roots_error_is_not_partial() {
+        let deployments = [
+            LiveComposefsDeployment {
+                verity: "booted".into(),
+                missing_verity_allowed: false,
+            },
+            LiveComposefsDeployment {
+                verity: "rollback".into(),
+                missing_verity_allowed: false,
+            },
+        ];
+        let result = collect_live_bound_image_roots(&deployments, |deployment| {
+            if deployment.verity == "rollback" {
+                anyhow::bail!("simulated unreadable deployment")
+            }
+            Ok(vec![crate::boundimage::BoundImage {
+                image: "registry.example/booted:latest".into(),
+                auth_file: None,
+            }])
+        });
+
+        assert!(result.is_err(), "a partial root set must not be returned");
+    }
+
+    #[test]
+    fn test_live_deployment_filter_excludes_orphans() {
+        let orphan = "orphaned".to_string();
+        let all_orphans = [&orphan];
+
+        assert!(deployment_is_live("booted", &all_orphans));
+        assert!(!deployment_is_live("orphaned", &all_orphans));
+    }
+
+    #[test]
+    fn test_live_deployments_only_relaxes_booted_policy() -> Result<()> {
+        let mut host = Host::default();
+        // Status currently reports the booted policy on all entries. Verify
+        // the GC mapping ignores those non-booted copies.
+        host.status.booted = Some(composefs_entry("booted", true));
+        host.status.staged = Some(composefs_entry("staged", true));
+        host.status.rollback = Some(composefs_entry("rollback", true));
+        host.status
+            .other_deployments
+            .push(composefs_entry("pinned", true));
+
+        let deployments = live_deployments_from_status(&host, &[], "booted", true)?;
+        assert_eq!(
+            deployments
+                .iter()
+                .map(|deployment| {
+                    (deployment.verity.clone(), deployment.missing_verity_allowed)
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("staged".into(), false),
+                ("booted".into(), true),
+                ("rollback".into(), false),
+                ("pinned".into(), false),
+            ]
+        );
+
+        let strict = live_deployments_from_status(&host, &[], "booted", false)?;
+        assert!(
+            strict
+                .iter()
+                .all(|deployment| !deployment.missing_verity_allowed)
+        );
+        Ok(())
     }
 
     /// Reproduce the shared-entry GC bug from issue #2102.
