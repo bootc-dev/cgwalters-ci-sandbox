@@ -14,7 +14,7 @@ permissions:
 
 on:
   push:
-    branches: [main]
+    branches: [main, test-bootc-oracle]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
@@ -50,7 +50,7 @@ jobs:
   #     is a record of what merged, not something new to gate)
   compute-ci-level:
     # Cheap metadata check (gh api + jq) — no need for a full VM.
-    runs-on: ubuntu-slim
+    runs-on: oracle-8cpu-32gb-x86-64
     outputs:
       package_os_matrix: ${{ steps.matrix.outputs.package_os_matrix }}
       integration_os_matrix: ${{ steps.matrix.outputs.integration_os_matrix }}
@@ -101,7 +101,10 @@ jobs:
           # Let this fail outright if the API call fails, rather than
           # guessing: required-checks-heavy (below) needs this job, so we
           # never silently skip testing on a transient API hiccup.
-          rules=$(gh api "repos/${{ github.repository }}/rules/branches/main")
+          rules=$(curl --fail-with-body -sS \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/rules/branches/main")
           if echo "$rules" | jq -e 'any(.[]; .type == "merge_queue")' > /dev/null; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
@@ -113,10 +116,12 @@ jobs:
         run: |
           LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
           EVENT='${{ github.event_name }}'
+          REF='${{ github.ref_name }}'
           MERGE_QUEUE_ENABLED='${{ steps.merge-queue.outputs.enabled }}'
           DOCS_ONLY='${{ steps.docs-check.outputs.docs_only }}'
 
           if [[ "$DOCS_ONLY" != "true" ]] && { [[ "$EVENT" == "merge_group" || "$EVENT" == "workflow_dispatch" ]] \
+              || [[ "$EVENT" == "push" && "$REF" == "test-bootc-oracle" ]] \
               || [[ "$EVENT" == "pull_request" && "$MERGE_QUEUE_ENABLED" != "true" ]] \
               || echo "$LABELS" | jq -e 'index("ci/merge")' > /dev/null; }; then
             # Full suite: all OSes
@@ -149,7 +154,7 @@ jobs:
         run: just validate
   # Check for security vulnerabilities and license compliance
   cargo-deny:
-    runs-on: ubuntu-26.04
+    runs-on: oracle-8cpu-32gb-x86-64
     steps:
     - uses: actions/checkout@v7
     - uses: EmbarkStudios/cargo-deny-action@v2
@@ -652,10 +657,10 @@ jobs:
   # Uses always() so it still reports a failure when an upstream heavy job failed,
   # rather than being skipped along with it.
   required-checks-heavy:
-    if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.compute-ci-level.outputs.merge_queue_enabled != 'true')) }}
+    if: ${{ always() && (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_name == 'test-bootc-oracle') || (github.event_name == 'pull_request' && needs.compute-ci-level.outputs.merge_queue_enabled != 'true')) }}
     needs: [compute-ci-level, cargo-deny, validate, install-tests, docs, package, test-integration, test-upgrade, test-baseconfigs, test-container-export]
     # Cheap aggregation (jq only) — no need for a full VM.
-    runs-on: ubuntu-slim
+    runs-on: oracle-8cpu-32gb-x86-64
     steps:
       - name: Check all jobs
         env:
@@ -679,7 +684,7 @@ jobs:
     if: always()
     needs: [compute-ci-level, validate, cargo-deny, docs, required-checks-heavy]
     # Cheap aggregation (jq only) — no need for a full VM.
-    runs-on: ubuntu-slim
+    runs-on: oracle-8cpu-32gb-x86-64
     steps:
       - name: Check required jobs
         env:
