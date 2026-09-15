@@ -15,7 +15,12 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Install Tailscale networking prerequisite
-        run: sudo dnf install -y iptables
+        run: |
+          sudo dnf install -y iptables
+          # RHEL's sudo secure_path excludes /usr/local/bin, where the action
+          # installs its downloaded binaries.
+          sudo ln -sfn /usr/local/bin/tailscale /usr/bin/tailscale
+          sudo ln -sfn /usr/local/bin/tailscaled /usr/bin/tailscaled
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
