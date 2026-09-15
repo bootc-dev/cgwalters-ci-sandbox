@@ -35,7 +35,7 @@ jobs:
           tar x -C /tmp/tmate -f /tmp/tmate.tar.xz --strip-components=1
           rm /tmp/tmate.tar.xz
           printf 'binary=%s\n' "$tmate"
-          "$tmate" --version
+          "$tmate" -V
           file "$tmate"
           ldd "$tmate" || true
 
