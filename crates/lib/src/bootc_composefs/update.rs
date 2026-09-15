@@ -19,8 +19,8 @@ use crate::spec::BootloaderKind;
 use crate::{
     bootc_composefs::{
         boot::{
-            BootSetupType, BootType, UKIDigestMismatch, print_uki_dumpfile_diff,
-            setup_composefs_bls_boot, setup_composefs_uki_boot,
+            BootSetupType, BootType, UKIDigestMismatch, accepted_boot_image_ids,
+            print_uki_dumpfile_diff, setup_composefs_bls_boot, setup_composefs_uki_boot,
         },
         gc::composefs_gc,
         repo::pull_composefs_repo,
@@ -340,7 +340,7 @@ pub(crate) async fn do_upgrade(
         Some(v1) => (v1.clone(), FormatVersion::V1),
         None => (id.clone(), repo.erofs_version()),
     };
-    let boot_ids: Vec<Sha512HashValue> = [boot_id_v1, boot_id_v2].into_iter().flatten().collect();
+    let boot_ids = accepted_boot_image_ids(boot_id_v1, boot_id_v2, &id);
 
     let (boot_digest, deploy_id) = match boot_type {
         BootType::Bls => (
