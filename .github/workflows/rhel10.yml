@@ -15,7 +15,7 @@ jobs:
   unit-tests:
     name: Rootless unit tests
     runs-on: rhel10-x86_64-16c-64g
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Bootstrap RHEL tools
         run: |
@@ -84,11 +84,37 @@ jobs:
           cargo --version
           BOOTC_jobs=8 just check-buildsys
 
-      - name: Always collect bounded diagnostics
+      - name: Stage 3 container workload
+        timeout-minutes: 240
+        run: |
+          set -euo pipefail
+          # Keep fetch separate so transient registry/buildroot failures can be
+          # distinguished from the actual image build and test workload.
+          BOOTC_jobs=8 just build-fetch
+          BOOTC_jobs=8 just build
+          podman run --rm --read-only localhost/bootc /usr/bin/bash -ceu '
+            test -s /etc/os-release
+            . /etc/os-release
+            test -n "${ID:-}"
+            test -n "${VERSION_ID:-}"
+            printf "OS metadata: ID=%s VERSION_ID=%s\n" "$ID" "$VERSION_ID"
+          '
+          BOOTC_jobs=8 just test-container-integration
+
+      - name: Always collect diagnostics and clean rootless storage
         if: always()
         run: |
           set +e
+          printf '%s\n' '--- final rootless Podman state ---'
           timeout 30s podman info 2>&1 || true
           timeout 30s podman system df 2>&1 || true
+          printf '%s\n' '--- final SELinux state and filesystems ---'
+          timeout 30s getenforce 2>&1 || true
+          timeout 30s findmnt -no TARGET,FSTYPE,OPTIONS / /var/tmp 2>&1 || true
           timeout 30s df -h / /var/tmp 2>&1 || true
+          printf '%s\n' '--- failed system units ---'
           timeout 30s systemctl --failed --no-pager 2>&1 || true
+          printf '%s\n' '--- remove containers and reclaim unused rootless storage ---'
+          timeout 60s podman rm --all --force 2>&1 || true
+          timeout 180s podman system prune --all --force --volumes 2>&1 || true
+          timeout 30s podman system df 2>&1 || true
