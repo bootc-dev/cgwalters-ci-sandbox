@@ -1893,13 +1893,27 @@ async fn install_with_sysroot(
 
     tracing::debug!("Performing post-deployment operations");
 
+    install_bound_images(bound_images, c_storage).await?;
+
+    Ok(())
+}
+
+/// Populate a target image store according to the install-time LBI mode.
+///
+/// Stored images are resolved before target mutation, but copying and pulling
+/// happen after the backend has installed its deployment and boot metadata.
+/// This keeps the target operation backend-neutral while retaining the
+/// existing OSTree ordering.
+async fn install_bound_images(
+    bound_images: BoundImages,
+    c_storage: &crate::podstorage::CStorage,
+) -> Result<()> {
     match bound_images {
         BoundImages::Skip => {}
         BoundImages::Resolved(resolved_bound_images) => {
-            // Now copy each bound image from the host's container storage into the target.
+            // Copy each image from the host's container storage into the target.
             for image in resolved_bound_images {
-                let image = image.image.as_str();
-                c_storage.pull_from_host_storage(image).await?;
+                c_storage.pull_from_host_storage(&image.image).await?;
             }
         }
         BoundImages::Unresolved(bound_images) => {
@@ -1908,7 +1922,6 @@ async fn install_with_sysroot(
                 .context("pulling bound images")?;
         }
     }
-
     Ok(())
 }
 
@@ -2020,7 +2033,12 @@ async fn install_to_filesystem_impl(
         }
     }
 
-    if state.composefs_options.composefs_backend {
+    let composefs_imgstore = if state.composefs_options.composefs_backend {
+        // Resolve `stored` LBIs before creating target deployment or boot
+        // metadata.  In particular, this must fail locally rather than falling
+        // back to a network pull after the target has been mutated.
+        let bound_images = BoundImages::from_state(state).await?;
+
         // Pre-flight disk space check for native composefs install path.
         {
             let imgref = &state.source.imageref;
@@ -2067,6 +2085,17 @@ async fn install_to_filesystem_impl(
         )
         .await?;
 
+        // The composefs repository initializer creates the target-relative
+        // ostree/bootc compatibility link, so CStorage resolves to the native
+        // composefs/bootc/storage location rather than an OSTree repository.
+        let run = Dir::open_ambient_dir("/run", cap_std::ambient_authority())?;
+        let c_storage = crate::podstorage::CStorage::create(
+            &rootfs.physical_root,
+            &run,
+            state.load_policy()?.as_ref(),
+        )?;
+        install_bound_images(bound_images, &c_storage).await?;
+        // Match the OSTree install path: label after all image writes.
         // Label composefs objects as /usr so they get usr_t rather than
         // default_t (which has no policy match).
         if let Some(policy) = state.load_policy()? {
@@ -2079,6 +2108,7 @@ async fn install_to_filesystem_impl(
             )
             .context("SELinux labeling of composefs objects")?;
         }
+        Some(c_storage)
     } else {
         ostree_install(state, rootfs, cleanup).await?;
 
@@ -2099,7 +2129,8 @@ async fn install_to_filesystem_impl(
                 .run_capture_stderr()
                 .context("Setting bootloader config to zipl")?;
         }
-    }
+        None
+    };
 
     // As the very last step before filesystem finalization, do a full SELinux
     // relabel of the physical root filesystem.  Any files that are already
@@ -2111,6 +2142,14 @@ async fn install_to_filesystem_impl(
             .context("Final SELinux relabeling of physical root")?;
     } else {
         tracing::debug!("Skipping final SELinux relabel (SELinux is disabled)");
+    }
+
+    // The composefs repository is labeled as /usr above, including its
+    // containers-storage subtree.  Relabel it last, even if a prior unified
+    // source pull left a stamp, so the store has its container labels on first
+    // boot. Normal booted-system calls retain the cheap stamped fast path.
+    if let Some(c_storage) = composefs_imgstore {
+        c_storage.ensure_labeled_for_install()?;
     }
 
     // Finalize mounted filesystems

@@ -287,11 +287,14 @@ unambiguous deployment read-only and leaves it in the caller's namespace.
 The composefs backend is experimental; on-disk formats are subject to change.
 
 This isolated candidate contains the V1/V2 repository, UKI, initramfs, and
-install changes, and is runtime-verified. The producer container built with
-the candidate bootc passed its real-container test. Cache/status and Type-1
-rollback prototypes are intentionally excluded and remain separate pending
-integration/VM work. Reported unit-test counts are useful regression evidence,
-not a replacement for the end-to-end matrix.
+install changes, and is runtime-verified for the scope described below. The
+producer container built with the candidate bootc passed its real-container
+test. The native logically bound image (LBI) install implementation is
+implemented and virt-validated on this stabilization branch; upstream and
+stability review are pending. Cache/status and Type-1 rollback prototypes are
+intentionally excluded and remain separate pending integration/VM work.
+Reported unit-test counts are useful regression evidence, not a replacement
+for the end-to-end matrix.
 
 ### Evidence recorded so far
 
@@ -301,16 +304,15 @@ not a replacement for the end-to-end matrix.
   `composefs-compat-verified-validation-20260912-02` verification round. The
   payload source was `b9e172…` and the producer container used the real
   candidate bootc.
-- The bootc 1.16.0 old-stager path was verified: V2 fallback booted the
-  current dual-digest UKI, a current-client update selected V1, and rollback
-  plus composefs GC succeeded. The current-stager path with a real 1.16
-  initramfs was also verified: automatic selection produced V2-only while
-  retaining current userspace. Its explicit-V1 negative control failed, and
-  the final V2 digest was verified.
-- These are opt-in, fixture-driven TMT tests, not fully automated CI coverage:
-  the fixture build recipe currently depends on ignored one-off files. Making
-  fixture production reproducible remains tracked work before treating this as
-  generally provisioned regression coverage.
+- The correctly selected bootc 1.16.0 legacy-directory preservation and
+  missing-link repair TMT cases passed. The fixture stages with the old client
+  first, then lets the old binary seed the real store before booting the
+  current client. This is important because the old 1.16 GC may itself prune
+  LBIs; the result validates the new client's preservation contract for an
+  existing real store, not a claim that old GC behavior has changed.
+- These are fixture-driven, opt-in TMT cases; fixture production is not fully
+  automated. Making it generally provisioned regression coverage remains
+  tracked work.
 - Sealed CentOS 10 V1/V2 tests and a strict-policy downgrade-rejection control
   were reported as passing on the combined tree. The CentOS 9 sealed-upgrade
   case was deliberately skipped, so it is not evidence of compatibility.
@@ -320,8 +322,18 @@ not a replacement for the end-to-end matrix.
   reboot, and first-boot deployment IDs and sentinels. The test installer uses
   `--disable-selinux`; this is not evidence for enforcing-label installation.
   It explicitly uses `--bound-images=skip`, so it provides no logically bound
-  image coverage. These first-boot fixtures are opt-in TMT coverage, not
-  generally provisioned CI fixtures.
+   image coverage. These first-boot fixtures are opt-in TMT coverage, not
+   generally provisioned CI fixtures.
+- Native LBI installation and retention passed the `native 22 enforcing`,
+  `OSTree 22`, plan 51 `stored`, `pull`, and `skip`, and `stored` with unified
+  storage and SELinux first-boot TMT modes. These establish the implemented
+  behavior for that exact scope: fresh stores take the native path; `stored`,
+  `pull`, and `skip` retain their respective semantics; and the final forced
+  container-storage SELinux label pass occurs after parent relabeling.
+- Healthy virt retention coverage passed for booted, staged, and rollback
+  deployments, including candidate LBI prefetch before staging and repair
+  before unified-storage probes. This is positive-path retention evidence; it
+  does not cover negative GC failure cases.
 
 The verified paths do not expand the compatibility contract beyond the exact
 bootc 1.16.0 fixtures and configurations tested above.
@@ -332,12 +344,30 @@ bootc 1.16.0 fixtures and configurations tested above.
    rather than an unrelated environment switch. It must consistently select
     repository format, BLS content, and state-directory identity. Acceptance is
     a BLS install test that proves all three agree.
-2. **Native composefs logically bound images during fresh install:** implement
-   and test the stored, pulled, and explicitly skipped `--bound-images` modes
-   for composefs. The current status API fresh-install test explicitly uses
-   `--bound-images=skip`; logical-bound installation remains a separate test
-   path. The compatibility-path migration and persistence rules require design
-   review before this can be treated as stable.
+2. **Native composefs logically bound images beyond the validated scope:** the
+   implementation is virt-validated for native fresh-install `stored`,
+   `pull`, and `skip` modes, enforcing labels, unified-storage first boot,
+   bootc 1.16 legacy-store preservation, writable missing-link repair, and
+   healthy retention paths. `stored` resolves locally before target mutation
+   and copies into composefs-backed bootc storage, `pull` fetches into that
+   store, and `skip` leaves it unpopulated. Fresh stores use the native path.
+   An existing real OSTree/bootc directory is reused without destructive
+   migration; the link is created or repaired only in writable installation or
+   upgrade paths. Candidate LBIs are prefetched before staging and immutable
+   LBIs are GC roots for every live deployment slot. The final forced
+   container-storage SELinux label pass runs after parent relabeling. Virt
+   coverage is limited to booted, staged, and rollback deployments; pinned and
+   other-slot retention coverage is unit-only.
+
+   Conservative failure gating and mixed-policy behavior have unit coverage:
+   a non-booted deployment uses the strict fallback because a public
+   per-deployment policy flag is not reliable, and an incomplete deployment
+   query skips the entire container-storage prune. Negative GC failure cases
+   are not virt-validated. Broader migration, corruption recovery, retention,
+   and per-deployment policy metadata coverage remains to be defined and
+   tested. The current status API fresh-install test explicitly uses
+   `--bound-images=skip`; its previously validated plan 50 offline API
+   coverage is unchanged and is not LBI coverage.
 3. **Status cache, Type-1 rollback, and BLS V2 controls:** these remain
    separate gaps. In particular, BLS has no supported install-time forced-V2
    control; do not infer one from the test image-build controls.

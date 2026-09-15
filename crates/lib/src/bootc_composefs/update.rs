@@ -327,6 +327,16 @@ pub(crate) async fn do_upgrade(
         anyhow::bail!("Merge conflicts found in etc");
     }
 
+    // Query the immutable candidate, not the currently booted /usr, and pull
+    // its LBIs before making bootloader or deployment-state changes. This
+    // matches the OSTree staging ordering and makes pull/parse errors atomic
+    // with respect to composefs staging.
+    let bound_images = crate::boundimage::query_bound_images(&mounted_fs)
+        .context("Querying bound images from candidate deployment")?;
+    crate::boundimage::pull_images(storage, bound_images)
+        .await
+        .context("Pulling bound images for candidate deployment")?;
+
     let boot_type = BootType::from(entry);
 
     let manifest_oci_digest: composefs_oci::OciDigest = manifest_digest
