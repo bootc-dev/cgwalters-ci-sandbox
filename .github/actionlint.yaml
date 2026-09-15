@@ -1,0 +1,4 @@
+# The sandbox organization provides this self-hosted runner label.
+self-hosted-runner:
+  labels:
+    - rhel10-x86_64-16c-64g

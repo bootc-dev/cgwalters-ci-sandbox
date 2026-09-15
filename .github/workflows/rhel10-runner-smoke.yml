@@ -1,0 +1,52 @@
+name: RHEL 10 runner smoke test
+
+on:
+  push:
+    branches: [rhel10-runner-smoke]
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: rhel10-x86_64-16c-64g
+    steps:
+      - name: Report runner and environment
+        shell: bash
+        run: |
+          set -u
+
+          printf '%s\n' '=== runner ==='
+          uname -a
+          printf 'architecture: '
+          uname -m
+          printf 'cpus: '
+          nproc
+          printf '%s\n' 'memory:'
+          cat /proc/meminfo
+          printf '%s\n' 'os-release:'
+          cat /etc/os-release
+
+          printf '%s\n' '=== commands ==='
+          for command in bash sudo systemctl systemd-run podman dnf git gh cargo rustc; do
+            if command -v "$command"; then
+              printf '%s: available\n' "$command"
+            else
+              printf '%s: unavailable\n' "$command"
+            fi
+          done
+
+          printf '%s\n' '=== sudo ==='
+          if sudo -n true 2>/dev/null; then
+            printf '%s\n' 'passwordless sudo: yes'
+          else
+            printf '%s\n' 'passwordless sudo: no'
+          fi
+
+          printf '%s\n' '=== systemd ==='
+          if command -v systemctl >/dev/null; then
+            systemctl is-system-running || true
+          fi
+          if command -v systemd-run >/dev/null; then
+            systemd-run --version | head -n 1
+          fi
