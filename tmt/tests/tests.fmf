@@ -206,3 +206,16 @@ check:
   - when: composefs_bridge == true
     enabled: true
   test: nu booted/test-49-composefs-1-16-bridge.nu
+
+/test-51-native-lbi-fresh-install:
+  summary: Verify native fresh install logical bound image modes
+  duration: 45m
+  environment:
+    LBI_FRESH_INSTALL_MODE: stored
+    LBI_FRESH_INSTALL_UNIFIED_STORAGE: '0'
+    LBI_FRESH_INSTALL_SELINUX: '0'
+  adjust:
+  - when: native_lbi_fresh_install != true
+    enabled: false
+    because: this retains a VM and disk for runtime coordinator approval
+  test: bash booted/test-51-native-lbi-fresh-install.sh

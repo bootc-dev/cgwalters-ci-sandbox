@@ -164,22 +164,32 @@ a `bootc` kickstart command that drives `to-filesystem` this way.
 
 #### Postprocessing after to-filesystem
 
-Some installation tools may want to inject additional data, such as adding
-an `/etc/hostname` into the target root. At the current time, bootc does
-not offer a direct API to do this. However, the backend for bootc is
-ostree, and it is possible to enumerate the deployments via ostree APIs.
+Some installation tools may want to inject additional data, such as adding an
+`/etc/hostname` into the target root. Mount the offline deployment explicitly
+in the caller's mount namespace:
 
-You can use `ostree admin --sysroot=/path/to/target --print-current-dir` to
-find the newly created deployment directory. For detailed examples and usage,
-see the [Injecting configuration before first boot](#before-reboot-injecting-new-configuration)
-section under `to-existing-root` documentation below.
+```bash
+mkdir /mnt/installed
+bootc install mount --sysroot /path/to/target --writable /mnt/installed
+# mutate /mnt/installed/etc and /mnt/installed/var as needed
+bootc install unmount /mnt/installed
+```
 
-We hope to provide a bootc-supported method to find the deployment in
-the future.
+Mounts are read-only by default. `--writable` enables only the persistent
+`/etc` and `/var` mounts; the deployment root and `/usr` remain read-only.
+The caller owns the mount namespace and must exclusively own the target until
+the mount is removed and finalization is complete.
 
 However, for tools that do perform any changes, there is a new
 `bootc install finalize` command which is optional, but recommended
 to run as the penultimate step before unmounting the target filesystem.
+
+The mount record is written after assembly. A crash before that write can leave
+mounts without a record; assembly is not transactionally crash-safe. Do not use
+generic unmount or cleanup commands, because the namespace may contain shared
+mounts. Inspect the mount table manually and use ordinary `umount` only for
+mounts whose source, mount ID, target, and read-only attributes have been
+verified.
 
 This command will perform some basic sanity checks and may also
 perform fixups on the target root. For example, a direction
@@ -251,22 +261,16 @@ previous installation.
 ##### Before reboot: Injecting new configuration
 
 After running `bootc install to-existing-root`, you may want to inject
-configuration files (such as `/etc/fstab`, systemd units, or other configuration)
-into the newly installed system before rebooting. The new deployment is located
-in the ostree repository structure at:
-
-`/target/ostree/deploy/<stateroot>/deploy/<checksum>.<serial>/`
-
-Where `<stateroot>` defaults to `default` unless specified via `--stateroot`.
-
-To find and modify the newly installed deployment:
+configuration files (such as `/etc/fstab`, systemd units, or other
+configuration) into the newly installed system before rebooting. Mount the
+target explicitly and mutate it through the mounted view:
 
 ```bash
-# Get the deployment path
-DEPLOY_PATH=$(ostree admin --sysroot=/target --print-current-dir)
+mkdir /mnt/installed
+bootc install mount --sysroot /target --writable /mnt/installed
 
 # Add a systemd mount unit
-cat > ${DEPLOY_PATH}/etc/systemd/system/data.mount <<EOF
+cat > /mnt/installed/etc/systemd/system/data.mount <<EOF
 [Unit]
 Description=Data partition
 
@@ -279,6 +283,8 @@ Type=xfs
 WantedBy=local-fs.target
 EOF
 ```
+
+bootc install unmount /mnt/installed
 
 ###### Injecting kernel arguments for local state
 
@@ -461,19 +467,13 @@ for legacy `/etc/fstab` references for `/` to use
 
 ## Configuring machine-local state
 
-Per the [filesystem](filesystem.md) section, `/etc` and `/var` are machine-local
-state by default.  If you want to inject additional content after the installation
-process, at the current time this can be done by manually finding the
-target "deployment root" which will be underneath `/ostree/deploy/<stateroot>/deploy/`.
-
-You can use `ostree admin --sysroot=/path/to/target --print-current-dir` to find
-the deployment directory. For detailed examples, see
-[Injecting configuration before first boot](#before-reboot-injecting-new-configuration).
-
-Installation software such as [Anaconda](https://github.com/rhinstaller/anaconda)
-do this today to implement generic `%post` scripts and the like.
-
-However, it is very likely that a generic bootc API to do this will be added.
+Per the [filesystem](filesystem.md) section, `/etc` and `/var` are
+machine-local state by default. To inject additional content after installation,
+use `bootc install mount --sysroot /path/to/target --writable /mnt/installed`
+and mutate `/mnt/installed/etc` or `/mnt/installed/var`. This is the
+backend-neutral interface for installation software such as
+[Anaconda](https://github.com/rhinstaller/anaconda) to implement `%post`
+scripts before first boot.
 
 ## Provisioning and first boot
 

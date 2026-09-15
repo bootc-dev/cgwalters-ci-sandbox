@@ -57,6 +57,21 @@ Matrix channel and a weekly video call meeting for example: <https://docs.fedora
 Are you interested in working on bootc?  Great!  See our [CONTRIBUTING.md](CONTRIBUTING.md) guide.
 There is also a list of [MAINTAINERS.md](MAINTAINERS.md), and please review our [Code of Conduct](CODE_OF_CONDUCT.md).
 
+### Fresh-install TMT plans
+
+Fresh-install plans must be given the exact local libvirt socket explicitly;
+the command must not fall back to another libvirt daemon:
+
+```console
+cargo xtask run-tmt --libvirt-connect 'qemu+unix:///session?socket=/run/user/<uid>/libvirt/virtqemud-sock' <image> native-lbi-fresh-install
+```
+
+Replace `<uid>` with the runtime owner’s UID and use the socket belonging to
+that user’s libvirt session.
+
+Fresh-install coverage is backend-specific; native composefs logically bound
+images remain separately covered by the logical-bound-install tests.
+
 ## Governance
 See [GOVERNANCE.md](GOVERNANCE.md) for project governance details.
 
