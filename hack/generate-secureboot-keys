@@ -1,11 +1,50 @@
 #!/bin/bash
 set -euo pipefail
-# Generate Secure Boot keys, only intended to be used for our CI pipeline.
-d=target/test-secureboot
-# This file existing signals completion
-if test -f "${d}/.done"; then exit 0; fi
-mkdir -p "$d"
-cd "$d"
+
+# Generate Secure Boot keys only for CI and local test images.  A completed key
+# directory may be reused (including a directory symlink), but never repaired:
+# replacing a partial or foreign key set could overwrite user material.
+d="${BOOTC_SECUREBOOT_DIR:-target/test-secureboot}"
+readonly expected=(GUID.txt PK.key PK.crt PK.cer KEK.key KEK.crt KEK.cer db.key db.crt db.cer .done)
+
+fail_unsafe_directory() {
+    echo "Refusing to replace incomplete or unsafe Secure Boot keys at ${d}" >&2
+    exit 1
+}
+
+validate_complete_keys() {
+    local name
+    for name in "${expected[@]}"; do
+        [[ -f "${d}/${name}" && ! -L "${d}/${name}" ]] || return 1
+    done
+    shopt -s nullglob dotglob
+    local entry base known
+    for entry in "${d}"/*; do
+        base=$(basename -- "${entry}")
+        known=0
+        for name in "${expected[@]}"; do
+            [[ "${base}" == "${name}" ]] && known=1
+        done
+        [[ ${known} -eq 1 && ! -d "${entry}" ]] || return 1
+    done
+    for name in PK KEK db; do
+        local key_modulus cert_modulus
+        key_modulus=$(openssl rsa -noout -modulus -in "${d}/${name}.key") || return 1
+        cert_modulus=$(openssl x509 -noout -modulus -in "${d}/${name}.crt") || return 1
+        [[ -n "${key_modulus}" && -n "${cert_modulus}" && "${key_modulus}" == "${cert_modulus}" ]] || return 1
+    done
+}
+
+if [[ -e "${d}" || -L "${d}" ]]; then
+    [[ -d "${d}" ]] || fail_unsafe_directory
+    validate_complete_keys || fail_unsafe_directory
+    echo "Reusing validated Secure Boot keys in ${d}"
+    exit 0
+fi
+
+umask 077
+mkdir -m 700 -- "${d}"
+cd -- "${d}"
 systemd-id128 new -u > GUID.txt
 openssl req -quiet -newkey rsa:4096 -nodes -keyout PK.key -new -x509 -sha256 -days 3650 -subj '/CN=Test Platform Key/' -out PK.crt
 openssl x509 -outform DER -in PK.crt -out PK.cer

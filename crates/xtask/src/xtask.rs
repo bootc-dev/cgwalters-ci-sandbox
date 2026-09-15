@@ -19,6 +19,7 @@ use xshell::{Shell, cmd};
 mod bcvk;
 mod buildsys;
 mod man;
+mod runner;
 mod sysext;
 mod tmt;
 
@@ -83,6 +84,8 @@ enum Commands {
     Spec,
     /// Run TMT tests using bcvk
     RunTmt(RunTmtArgs),
+    /// Run a command with a persistent log and an exact exit status
+    RunLogged(runner::RunLoggedArgs),
     /// Provision a VM for manual TMT testing
     TmtProvision(TmtProvisionArgs),
     /// Check build system properties (e.g., reproducible builds)
@@ -301,6 +304,10 @@ pub(crate) struct RunTmtArgs {
     /// qemu+unix socket path.  Required by plans which replace a VM disk.
     #[arg(long, value_name = "URI")]
     pub(crate) libvirt_connect: Option<String>,
+
+    /// Directory containing keys enrolled by secure boot test firmware.
+    #[arg(long, env = "BOOTC_secureboot_dir", default_value = bcvk::DEFAULT_SB_KEYS_DIR)]
+    pub(crate) secure_boot_keys: Utf8PathBuf,
 }
 
 impl RunTmtArgs {
@@ -398,6 +405,7 @@ fn try_main() -> Result<()> {
             args.resolve_composefs();
             tmt::run_tmt(&sh, &args)
         }
+        Commands::RunLogged(args) => runner::run_logged(&args),
         Commands::TmtProvision(args) => tmt::tmt_provision(&sh, &args),
         Commands::CheckBuildsys => buildsys::check_buildsys(&sh, "Dockerfile".into()),
         Commands::ValidateComposefsDigest(args) => validate_composefs_digest(&sh, &args),
