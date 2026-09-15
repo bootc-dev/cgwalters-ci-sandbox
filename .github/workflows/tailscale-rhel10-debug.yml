@@ -35,7 +35,7 @@ jobs:
       - name: Report safe connection diagnostics
         run: |
           set -euo pipefail
-          tailscale status
+          tailscale status --self
           printf 'IPv4: '
           tailscale ip -4
           printf 'Hostname: '
@@ -44,7 +44,7 @@ jobs:
       - name: Keep runner available for debugging
         run: |
           set -euo pipefail
-          for elapsed in $(seq 0 540 20); do
+          for elapsed in $(seq 0 1140 20); do
             printf 'Debug access remains available (%ss elapsed)\n' "$elapsed"
             sleep 20
           done
