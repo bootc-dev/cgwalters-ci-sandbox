@@ -44,7 +44,7 @@ jobs:
       - name: Keep runner available for debugging
         run: |
           set -euo pipefail
-          for elapsed in $(seq 0 1140 20); do
+          for elapsed in $(seq 0 20 1140); do
             printf 'Debug access remains available (%ss elapsed)\n' "$elapsed"
             sleep 20
           done
