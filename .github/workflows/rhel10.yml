@@ -1,0 +1,80 @@
+name: RHEL 10 CI
+
+on:
+  push:
+    branches: [test-bootc-rhel10]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rhel10-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Rootless unit tests
+    runs-on: rhel10-x86_64-16c-64g
+    timeout-minutes: 120
+    steps:
+      - name: Bootstrap RHEL tools
+        run: |
+          set -euo pipefail
+          sudo dnf install -y git-core podman curl tar gzip
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install pinned just
+        run: |
+          set -euo pipefail
+          version=1.58.0
+          asset="just-${version}-x86_64-unknown-linux-musl.tar.gz"
+          url="https://github.com/casey/just/releases/download/${version}/${asset}"
+          expected_sha256=4a5cc2f53e6f0f8c59092a6cc38291eb729d46a7dd95d3ae582008881b84931d
+          curl --fail --location --retry 3 --output /tmp/just.tar.gz "$url"
+          printf '%s  %s\n' "$expected_sha256" /tmp/just.tar.gz | sha256sum --check
+          tar -xzf /tmp/just.tar.gz -C /tmp just
+          sudo install -m 0755 /tmp/just /usr/local/bin/just
+          just --version
+
+      - name: Collect host diagnostics
+        run: |
+          set +e
+          timeout 30s bash -c 'dnf repolist; dnf list --available podman git-core curl tar gzip' || true
+          timeout 30s bash -c 'if command -v subscription-manager; then subscription-manager status; subscription-manager identity; fi' || true
+          timeout 30s systemctl --failed --no-pager || true
+          timeout 30s systemctl is-system-running || true
+          printf '%s\n' '--- namespaces and subordinate IDs ---'
+          cat /etc/subuid /etc/subgid 2>&1 || true
+          sysctl user.max_user_namespaces 2>&1 || true
+          printf '%s\n' '--- fuse and SELinux ---'
+          ls -l /dev/fuse 2>&1 || true
+          if command -v getenforce; then getenforce; fi
+          if command -v sestatus; then sestatus; fi
+          printf '%s\n' '--- rootless podman ---'
+          podman info 2>&1 || true
+          podman info --format '{{json .Store}}' 2>&1 || true
+          df -h / /var/tmp 2>&1 || true
+
+      - name: Rootless Podman smoke
+        run: |
+          set -euo pipefail
+          podman pull quay.io/podman/hello:latest
+          podman run --rm quay.io/podman/hello:latest
+          printf '%s\n' 'FROM scratch' 'LABEL rhel10-ci=smoke' > /tmp/Containerfile
+          podman build --file /tmp/Containerfile --tag localhost/rhel10-ci-smoke .
+
+      - name: Unit tests
+        run: BOOTC_jobs=8 just unit-tests
+
+      - name: Always collect bounded diagnostics
+        if: always()
+        run: |
+          set +e
+          timeout 30s podman info 2>&1 || true
+          timeout 30s podman system df 2>&1 || true
+          timeout 30s df -h / /var/tmp 2>&1 || true
+          timeout 30s systemctl --failed --no-pager 2>&1 || true
