@@ -40,6 +40,12 @@ jobs:
           sudo install -m 0755 /tmp/just /usr/local/bin/just
           just --version
 
+      - name: Install native build prerequisites
+        run: sudo dnf install -y gcc
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Collect host diagnostics
         run: |
           set +e
@@ -69,6 +75,14 @@ jobs:
 
       - name: Unit tests
         run: BOOTC_jobs=8 just unit-tests
+
+      - name: Record toolchain and check build system
+        run: |
+          set -euo pipefail
+          gcc --version | head -n 1
+          rustc --version
+          cargo --version
+          BOOTC_jobs=8 just check-buildsys
 
       - name: Always collect bounded diagnostics
         if: always()
