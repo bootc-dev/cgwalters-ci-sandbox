@@ -404,6 +404,30 @@ jobs:
 
       - name: Run TMT integration tests
         run: |
+          # Session daemons exit when idle. Activate this runner's private daemon
+          # immediately before TMT and keep it alive while images are prepared.
+          virsh --connect qemu:///session list
+          LIBVIRT_SOCKET=
+          for candidate in \
+            "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR must be set}/libvirt/virtqemud-sock" \
+            "$XDG_RUNTIME_DIR/libvirt/libvirt-sock"; do
+            if test -S "$candidate"; then
+              LIBVIRT_SOCKET="$candidate"
+              break
+            fi
+          done
+          if test -z "$LIBVIRT_SOCKET"; then
+            echo "No private libvirt session socket found under $XDG_RUNTIME_DIR/libvirt" >&2
+            exit 1
+          fi
+          export BOOTC_libvirt_connect="qemu+unix:///session?socket=$LIBVIRT_SOCKET"
+          virsh --connect "$BOOTC_libvirt_connect" list
+          while sleep 30; do
+            virsh --connect "$BOOTC_libvirt_connect" list >/dev/null || exit
+          done &
+          libvirt_keepalive_pid=$!
+          trap 'kill "$libvirt_keepalive_pid" 2>/dev/null || :' EXIT
+
           if [[ "${{ matrix.variant }}" = composefs ]]; then
             just test-composefs "${{ matrix.bootloader }}"  "${{ matrix.filesystem }}" "${{ matrix.boot_type }}" "${{ matrix.seal_state }}"
           else

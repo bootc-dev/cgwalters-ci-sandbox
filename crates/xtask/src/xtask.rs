@@ -296,6 +296,11 @@ pub(crate) struct RunTmtArgs {
     /// Each VM gets its own subdirectory: `<log-dir>/<vm-name>/`
     #[arg(long)]
     pub(crate) log_dir: Option<camino::Utf8PathBuf>,
+
+    /// Explicit local libvirt URI for fresh-install tests, including its
+    /// qemu+unix socket path.  Required by plans which replace a VM disk.
+    #[arg(long, value_name = "URI")]
+    pub(crate) libvirt_connect: Option<String>,
 }
 
 impl RunTmtArgs {
@@ -821,5 +826,25 @@ mod tests {
         assert_eq!(parse_cli_bool("false"), Ok(false));
         assert!(parse_cli_bool("").is_err());
         assert!(parse_cli_bool("maybe").is_err());
+    }
+
+    #[test]
+    fn test_run_tmt_accepts_explicit_libvirt_connection() {
+        let cli = Cli::try_parse_from([
+            "xtask",
+            "run-tmt",
+            "--libvirt-connect",
+            "qemu+unix:///session?socket=/run/user/UID/libvirt/virtqemud-sock",
+            "localhost/bootc",
+            "status-fresh-install",
+        ])
+        .unwrap();
+        let Commands::RunTmt(args) = cli.command else {
+            panic!("expected run-tmt command");
+        };
+        assert_eq!(
+            args.libvirt_connect.as_deref(),
+            Some("qemu+unix:///session?socket=/run/user/UID/libvirt/virtqemud-sock")
+        );
     }
 }

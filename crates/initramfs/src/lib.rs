@@ -68,9 +68,9 @@ fn mount_setattr(fd: impl AsFd, flags: libc::c_int, attr: &MountAttr) -> Result<
     Ok(())
 }
 
-/// Set mount to readonly
+/// Set a detached mount tree read-only without reopening its path.
 #[context("Setting mount readonly")]
-fn set_mount_readonly(fd: impl AsFd) -> Result<()> {
+pub fn set_mount_readonly(fd: impl AsFd) -> Result<()> {
     let attr = MountAttr {
         attr_set: MOUNT_ATTR_RDONLY,
         attr_clr: 0,
@@ -374,6 +374,40 @@ pub fn mount_composefs_image(
 
     set_mount_readonly(&rootfs)?;
 
+    Ok(rootfs)
+}
+
+/// Read-only variant for offline inspection and explicit installation mounts.
+/// Unlike [`mount_composefs_image`], this never upgrades repository metadata.
+#[context("Mounting composefs image without repository upgrade")]
+pub fn mount_composefs_image_readonly(
+    sysroot: &OwnedFd,
+    name: &str,
+    allow_missing_fsverity: bool,
+) -> Result<OwnedFd> {
+    let mut repo = Repository::<Sha512HashValue>::open_path(sysroot, "composefs")
+        .context("Opening composefs repository read-only")?;
+    if allow_missing_fsverity {
+        repo.set_insecure();
+    }
+    let (image, enable_verity) = repo.open_image(name)?;
+    validate_image_verity(enable_verity, allow_missing_fsverity)
+        .with_context(|| format!("Validating fs-verity for composefs image {name}"))?;
+    let objects = repo.objects_dir().context("Getting objects directory")?;
+    let verity = if enable_verity {
+        VerityRequirement::Required
+    } else {
+        VerityRequirement::Disabled
+    };
+    let rootfs = composefs_fsmount(
+        image,
+        name,
+        &[objects.as_fd()],
+        verity,
+        &MountOptions::default(),
+    )
+    .context("Creating filesystem mount")?;
+    set_mount_readonly(&rootfs)?;
     Ok(rootfs)
 }
 

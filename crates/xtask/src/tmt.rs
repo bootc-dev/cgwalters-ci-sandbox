@@ -29,11 +29,47 @@ const FIELD_FIXME_SKIP_IF_UKI: &str = "fixme_skip_if_uki";
 /// For tests that should only run for composefs systems
 /// Ex. composefs-gc
 const FIELD_SKIP_IF_OSTREE: &str = "skip_if_ostree";
+/// Test-only flow which installs a second disk from within the guest, then has
+/// the connect provisioner switch the already-owned libvirt domain to it.
+const FIELD_FRESH_INSTALL_DISK: &str = "fresh_install_disk";
 
 // bcvk options
 const BCVK_OPT_BIND_STORAGE_RO: &str = "--bind-storage-ro";
 const ENV_BOOTC_UPGRADE_IMAGE: &str = "BOOTC_upgrade_image";
 const ENV_BOOTC_BRIDGE_IMAGE: &str = "BOOTC_bridge_image";
+const FRESH_INSTALL_DISK_SIZE: &str = "20G";
+const FRESH_INSTALL_DISK_TARGET: &str = "vdb";
+const TMT_CONNECT_REBOOT_UNSAFE_BEHAVIOR: &str =
+    "--allow-unsafe-behavior=provision/connect.reboot-commands";
+
+fn fresh_install_soft_reboot_command(
+    helper: &std::path::Path,
+    record: &Utf8Path,
+) -> Result<String> {
+    let helper = helper
+        .to_str()
+        .context("fresh-install reboot helper path is not UTF-8")?;
+    let helper = shlex::try_quote(helper).context("quoting fresh-install reboot helper")?;
+    let record = shlex::try_quote(record.as_str()).context("quoting fresh-install disk record")?;
+    Ok(format!("/bin/bash {helper} {record}"))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct FreshInstallDiskRecord {
+    domain_name: String,
+    domain_uuid: String,
+    initial_disk: String,
+    volume_name: String,
+    pool_uuid: String,
+    volume_key: String,
+    volume_path: String,
+    connection_uri: String,
+    socket_path: String,
+    socket_dev: String,
+    socket_ino: String,
+    virsh_path: String,
+    active_domain_id: String,
+}
 
 // Distro identifiers
 const DISTRO_CENTOS_9: &str = "centos-9";
@@ -41,6 +77,81 @@ const DISTRO_CENTOS_9: &str = "centos-9";
 // Import the argument types from xtask.rs
 use crate::bcvk::BcvkInstallOpts;
 use crate::{RunTmtArgs, SealState, TmtProvisionArgs, out_of_sync_error};
+
+#[derive(Clone, Debug)]
+struct LibvirtConnection {
+    uri: String,
+    socket_path: String,
+    socket_dev: String,
+    socket_ino: String,
+    virsh_path: String,
+}
+
+fn validate_libvirt_connection(uri: &str, virsh_path: &str) -> Result<LibvirtConnection> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let (base, query) = uri
+        .split_once('?')
+        .context("libvirt URI must contain a socket query parameter")?;
+    if base != "qemu+unix:///session" || query.contains('&') {
+        anyhow::bail!(
+            "fresh-install libvirt connection must be a qemu+unix URI with only socket=..."
+        );
+    }
+    let socket_path = query
+        .strip_prefix("socket=")
+        .filter(|path| !path.is_empty() && path.starts_with('/'))
+        .context("fresh-install libvirt URI requires an absolute socket= path")?;
+    let socket_metadata = std::fs::metadata(socket_path)
+        .with_context(|| format!("Reading libvirt socket {socket_path}"))?;
+    if !socket_metadata.file_type().is_socket() {
+        anyhow::bail!("libvirt socket path is not a Unix socket: {socket_path}");
+    }
+    let virsh_metadata = std::fs::metadata(virsh_path)
+        .with_context(|| format!("Reading virsh executable {virsh_path}"))?;
+    if !virsh_metadata.is_file() || !is_executable(&virsh_metadata) {
+        anyhow::bail!("virsh path is not an executable file: {virsh_path}");
+    }
+    Ok(LibvirtConnection {
+        uri: uri.to_string(),
+        socket_path: socket_path.to_string(),
+        socket_dev: socket_metadata.dev().to_string(),
+        socket_ino: socket_metadata.ino().to_string(),
+        virsh_path: virsh_path.to_string(),
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn resolve_libvirt_connection(sh: &Shell, uri: &str) -> Result<LibvirtConnection> {
+    let virsh_path = cmd!(sh, "which virsh")
+        .read()
+        .context("Locating virsh for fresh-install tests")?;
+    let virsh_path = virsh_path.trim();
+    if virsh_path != "/usr/bin/virsh" {
+        anyhow::bail!("fresh-install tests require canonical /usr/bin/virsh, found {virsh_path}");
+    }
+    validate_libvirt_connection(uri, virsh_path)
+}
+
+fn bcvk_run_args(connect_uri: Option<&str>) -> Vec<String> {
+    let mut args = vec!["libvirt".to_string()];
+    if let Some(uri) = connect_uri {
+        args.extend(["--connect".to_string(), uri.to_string()]);
+    }
+    args.push("run".to_string());
+    args
+}
 
 /// Generate a random alphanumeric suffix for VM names
 fn generate_random_suffix() -> String {
@@ -152,7 +263,11 @@ fn distro_supports_bind_storage_ro(distro: &str) -> bool {
 /// of such failures in CI is the host filesystem running out of space, so we
 /// dump what is consuming it: container images, libvirt VMs/disks, the tmt log
 /// directory, and the runner's home directory.
-fn collect_infra_diagnostics(sh: &Shell, base_log_dir: &Utf8Path) {
+fn collect_infra_diagnostics(
+    sh: &Shell,
+    base_log_dir: &Utf8Path,
+    connection: Option<&LibvirtConnection>,
+) {
     println!("\n========================================");
     println!("Infrastructure diagnostics (VM launch failed)");
     println!("========================================");
@@ -167,7 +282,14 @@ fn collect_infra_diagnostics(sh: &Shell, base_log_dir: &Utf8Path) {
 
     // Libvirt VMs and their backing disks (bcvk may leave these around).
     println!("\n--- bcvk libvirt list ---");
-    let _ = cmd!(sh, "bcvk libvirt list").ignore_status().run();
+    if let Some(connection) = connection {
+        let uri = &connection.uri;
+        let _ = cmd!(sh, "bcvk libvirt --connect {uri} list")
+            .ignore_status()
+            .run();
+    } else {
+        let _ = cmd!(sh, "bcvk libvirt list").ignore_status().run();
+    }
 
     // Per-VM log/console/journal captures under the tmt log directory.
     println!("\n--- du -sh {base_log_dir} ---");
@@ -190,15 +312,29 @@ fn collect_infra_diagnostics(sh: &Shell, base_log_dir: &Utf8Path) {
 
 /// Wait for a bcvk VM to be ready and return SSH connection info
 #[context("Waiting for VM to be ready")]
-fn wait_for_vm_ready(sh: &Shell, vm_name: &str) -> Result<(u16, String)> {
+fn wait_for_vm_ready(
+    sh: &Shell,
+    vm_name: &str,
+    connection: Option<&LibvirtConnection>,
+) -> Result<(u16, String)> {
     use std::thread;
     use std::time::Duration;
 
     for attempt in 1..=VM_READY_TIMEOUT_SECS {
-        if let Ok(json_output) = cmd!(sh, "bcvk libvirt inspect {vm_name} --format=json")
+        let inspect = if let Some(connection) = connection {
+            let uri = &connection.uri;
+            cmd!(
+                sh,
+                "bcvk libvirt --connect {uri} inspect {vm_name} --format=json"
+            )
             .ignore_stderr()
             .read()
-        {
+        } else {
+            cmd!(sh, "bcvk libvirt inspect {vm_name} --format=json")
+                .ignore_stderr()
+                .read()
+        };
+        if let Ok(json_output) = inspect {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_output) {
                 if let (Some(ssh_port), Some(ssh_key)) = (
                     json.get("ssh_port").and_then(|v| v.as_u64()),
@@ -265,12 +401,155 @@ fn verify_ssh_connectivity(sh: &Shell, port: u16, key_path: &Utf8Path) -> Result
     )
 }
 
+/// Create the only resources used by the fresh-install test.  They deliberately
+/// are not cleaned up: the test changes a VM's boot disk and a coordinator must
+/// review the exact IDs printed here before removing either resource.
+#[context("Preparing fresh install disk")]
+fn prepare_fresh_install_disk(
+    sh: &Shell,
+    vm_name: &str,
+    connection: &LibvirtConnection,
+) -> Result<Utf8PathBuf> {
+    let resources_dir = fresh_install_resources_dir(sh)?;
+    sh.create_dir(&resources_dir)
+        .with_context(|| format!("Creating fresh-install resource directory {resources_dir}"))?;
+    let virsh = &connection.virsh_path;
+    let uri = &connection.uri;
+    let domain_uuid = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} domuuid {vm_name}"
+    )
+    .read()
+    .context("Reading owned domain UUID")?;
+    let domain_uuid = domain_uuid.trim();
+    if domain_uuid.is_empty() {
+        anyhow::bail!("virsh returned an empty UUID for domain {vm_name}");
+    }
+    let active_domain_id = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} domid {domain_uuid}"
+    )
+    .read()
+    .context("Reading active owned domain ID")?;
+    let active_domain_id = active_domain_id.trim();
+    if active_domain_id.is_empty() || active_domain_id == "-" {
+        anyhow::bail!("owned domain {domain_uuid} is not active");
+    }
+    let initial_disk = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} domblklist {domain_uuid} --details"
+    )
+    .read()
+    .context("Recording initial domain disks")?;
+    let initial_source = initial_disk
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.len() >= 4 && fields[1] == "disk" && fields[2] == "vda")
+                .then(|| fields[3].to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("Could not identify the owned domain's vda disk"))?;
+
+    let volume_name = format!("{vm_name}-fresh-install.raw");
+    let context_path = resources_dir.join(format!("{vm_name}.json"));
+    // Keep ownership information even if volume creation itself fails.
+    let mut record = FreshInstallDiskRecord {
+        domain_name: vm_name.to_string(),
+        domain_uuid: domain_uuid.to_string(),
+        initial_disk: initial_source,
+        volume_name: volume_name.clone(),
+        pool_uuid: String::new(),
+        volume_key: String::new(),
+        volume_path: String::new(),
+        connection_uri: connection.uri.clone(),
+        socket_path: connection.socket_path.clone(),
+        socket_dev: connection.socket_dev.clone(),
+        socket_ino: connection.socket_ino.clone(),
+        virsh_path: connection.virsh_path.clone(),
+        active_domain_id: active_domain_id.to_string(),
+    };
+    write_fresh_install_disk_record(&context_path, &record)?;
+    cmd!(sh, "timeout --kill-after=10s 60s {virsh} --connect {uri} vol-create-as default {volume_name} {FRESH_INSTALL_DISK_SIZE} --format raw")
+        .run()
+        .context("Creating fresh-install volume")?;
+    let volume_path = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} vol-path --pool default {volume_name}"
+    )
+    .read()
+    .context("Reading fresh-install volume path")?;
+    let volume_path = volume_path.trim();
+    let volume_key = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} vol-key --pool default {volume_name}"
+    )
+    .read()
+    .context("Reading fresh-install volume key")?;
+    let pool_uuid = cmd!(
+        sh,
+        "timeout --kill-after=10s 30s {virsh} --connect {uri} pool-uuid default"
+    )
+    .read()
+    .context("Reading fresh-install pool UUID")?;
+    record.pool_uuid = pool_uuid.trim().to_string();
+    record.volume_key = volume_key.trim().to_string();
+    record.volume_path = volume_path.to_string();
+    write_fresh_install_disk_record(&context_path, &record)?;
+    cmd!(sh, "timeout --kill-after=10s 60s {virsh} --connect {uri} attach-disk {domain_uuid} {volume_path} {FRESH_INSTALL_DISK_TARGET} --live --config --driver qemu --subdriver raw")
+        .run()
+        .context("Attaching fresh-install volume as vdb")?;
+
+    println!(
+        "Fresh-install resources retained: domain={} uuid={} volume={} pool_uuid={} key={} path={}",
+        record.domain_name,
+        record.domain_uuid,
+        record.volume_name,
+        record.pool_uuid,
+        record.volume_key,
+        record.volume_path
+    );
+    Ok(context_path)
+}
+
+/// Resolve paths from xshell's directory, not the process CWD. `run_tmt()`
+/// pushes its copied workdir on the shell only, so std::fs relative paths would
+/// otherwise write records somewhere different from shell-created directories.
+fn fresh_install_resources_dir(sh: &Shell) -> Result<Utf8PathBuf> {
+    let root = std::fs::canonicalize(sh.current_dir()).with_context(|| {
+        format!(
+            "Canonicalizing xtask shell directory {:?}",
+            sh.current_dir()
+        )
+    })?;
+    let root = Utf8PathBuf::try_from(root).context("xtask shell directory is not valid UTF-8")?;
+    Ok(root.join("target/tmt-fresh-install-disks"))
+}
+
+fn tmt_unsafe_behavior_args(fresh_install_disk: bool) -> Vec<&'static str> {
+    fresh_install_disk
+        .then_some(TMT_CONNECT_REBOOT_UNSAFE_BEHAVIOR)
+        .into_iter()
+        .collect()
+}
+
+fn write_fresh_install_disk_record(path: &Utf8Path, record: &FreshInstallDiskRecord) -> Result<()> {
+    std::fs::write(path, serde_json::to_vec(record)?)
+        .with_context(|| format!("Writing fresh-install resource record {path}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default)]
 struct PlanMetadata {
     try_bind_storage: bool,
     skip_if_composefs: bool,
     skip_if_ostree: bool,
     skip_if_uki: bool,
+    fresh_install_disk: bool,
 }
 
 /// Parse integration.fmf to extract extra-try_bind_storage for all plans
@@ -356,6 +635,21 @@ fn parse_plan_metadata(
                     .and_modify(|m| m.skip_if_ostree = b)
                     .or_insert(PlanMetadata {
                         skip_if_ostree: b,
+                        ..Default::default()
+                    });
+            }
+        }
+
+        if let Some(fresh_install_disk) = plan_data.get(&serde_yaml::Value::String(format!(
+            "extra-{}",
+            FIELD_FRESH_INSTALL_DISK
+        ))) {
+            if let Some(b) = fresh_install_disk.as_bool() {
+                plan_metadata
+                    .entry(plan_name.to_string())
+                    .and_modify(|m| m.fresh_install_disk = b)
+                    .or_insert(PlanMetadata {
+                        fresh_install_disk: b,
                         ..Default::default()
                     });
             }
@@ -503,6 +797,21 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
     println!("Found {} test plan(s): {:?}", plans.len(), plans);
 
+    let fresh_install_selected = plans.iter().any(|plan| {
+        plan_metadata
+            .iter()
+            .find(|(key, _)| plan.ends_with(key.as_str()))
+            .map(|(_, metadata)| metadata.fresh_install_disk)
+            .unwrap_or(false)
+    });
+    let libvirt_connection = match args.libvirt_connect.as_deref() {
+        Some(uri) => Some(resolve_libvirt_connection(sh, uri)?),
+        None if fresh_install_selected => anyhow::bail!(
+            "fresh-install plans require --libvirt-connect qemu+unix:///...?...socket=..."
+        ),
+        None => None,
+    };
+
     // Determine base log directory: CLI flag > TMT_LOG_DIR env var > default.
     // Filter out empty TMT_LOG_DIR (e.g. TMT_LOG_DIR="") to avoid creating
     // log subdirectories in the current working directory.
@@ -516,11 +825,20 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
     // Probe whether this bcvk supports --log-dir (added in bcvk 0.17).
     // Older installs silently lack it; we skip the flag rather than hard-failing.
-    let bcvk_has_log_dir = cmd!(sh, "bcvk libvirt run --help")
-        .ignore_stderr()
-        .read()
-        .map(|help| help.contains("--log-dir"))
-        .unwrap_or(false);
+    let bcvk_has_log_dir = if let Some(connection) = &libvirt_connection {
+        let uri = &connection.uri;
+        cmd!(sh, "bcvk libvirt --connect {uri} run --help")
+            .ignore_stderr()
+            .read()
+            .map(|help| help.contains("--log-dir"))
+            .unwrap_or(false)
+    } else {
+        cmd!(sh, "bcvk libvirt run --help")
+            .ignore_stderr()
+            .read()
+            .map(|help| help.contains("--log-dir"))
+            .unwrap_or(false)
+    };
 
     // Generate a random suffix for VM names
     let random_suffix = generate_random_suffix();
@@ -536,6 +854,11 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     for plan in plans {
         let plan_name = sanitize_plan_name(plan);
         let vm_name = format!("bootc-tmt-{}-{}", random_suffix, plan_name);
+        let fresh_install_disk = plan_metadata
+            .iter()
+            .find(|(key, _)| plan.ends_with(key.as_str()))
+            .map(|(_, v)| v.fresh_install_disk)
+            .unwrap_or(false);
 
         println!("\n========================================");
         println!("Running plan: {}", plan);
@@ -609,11 +932,28 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
         // Launch VM with bcvk
         let firmware_args_slice = firmware_args.as_slice();
-        let launch_result = cmd!(
-            sh,
-            "bcvk libvirt run --name {vm_name} --detach {firmware_args_slice...} {COMMON_INST_ARGS...} {plan_bcvk_opts...} {log_dir_args...} {image}"
-        )
-        .run()
+        let launch_result = if let Some(connection) = &libvirt_connection {
+            let connect_uri = &connection.uri;
+            let bcvk_args = bcvk_run_args(Some(connect_uri));
+            let libvirt = &bcvk_args[0];
+            let connect = &bcvk_args[1];
+            let uri = &bcvk_args[2];
+            let run = &bcvk_args[3];
+            cmd!(
+                sh,
+                "bcvk {libvirt} {connect} {uri} {run} --name {vm_name} --detach {firmware_args_slice...} {COMMON_INST_ARGS...} {plan_bcvk_opts...} {log_dir_args...} {image}"
+            )
+            .run()
+        } else {
+            let bcvk_args = bcvk_run_args(None);
+            let libvirt = &bcvk_args[0];
+            let run = &bcvk_args[1];
+            cmd!(
+                sh,
+                "bcvk {libvirt} {run} --name {vm_name} --detach {firmware_args_slice...} {COMMON_INST_ARGS...} {plan_bcvk_opts...} {log_dir_args...} {image}"
+            )
+            .run()
+        }
         .context("Launching VM with bcvk");
 
         if let Err(e) = launch_result {
@@ -624,7 +964,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             // diagnostics and abort the entire run immediately.
             eprintln!("Failed to launch VM for plan {}: {:#}", plan, e);
             test_results.push((plan.to_string(), false, None));
-            collect_infra_diagnostics(sh, &base_log_dir);
+            collect_infra_diagnostics(sh, &base_log_dir, libvirt_connection.as_ref());
             anyhow::bail!(
                 "Aborting test run: failed to launch VM for plan {} (infrastructure failure); see diagnostics above",
                 plan
@@ -633,20 +973,36 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
         // Ensure VM cleanup happens even on error (unless --preserve-vm is set)
         let cleanup_vm = || {
-            if preserve_vm {
+            if preserve_vm || fresh_install_disk {
+                if fresh_install_disk {
+                    println!(
+                        "Retaining {vm_name}: fresh-install-disk resources require coordinator approval for cleanup"
+                    );
+                }
                 return;
             }
-            if let Err(e) = cmd!(sh, "bcvk libvirt rm --stop --force {vm_name}")
+            let result = if let Some(connection) = &libvirt_connection {
+                let uri = &connection.uri;
+                cmd!(
+                    sh,
+                    "bcvk libvirt --connect {uri} rm --stop --force {vm_name}"
+                )
                 .ignore_stderr()
                 .ignore_status()
                 .run()
-            {
+            } else {
+                cmd!(sh, "bcvk libvirt rm --stop --force {vm_name}")
+                    .ignore_stderr()
+                    .ignore_status()
+                    .run()
+            };
+            if let Err(e) = result {
                 eprintln!("Warning: Failed to cleanup VM {}: {}", vm_name, e);
             }
         };
 
         // Wait for VM to be ready and get SSH info
-        let vm_info = wait_for_vm_ready(sh, &vm_name);
+        let vm_info = wait_for_vm_ready(sh, &vm_name, libvirt_connection.as_ref());
         let (ssh_port, ssh_key) = match vm_info {
             Ok((port, key)) => (port, key),
             Err(e) => {
@@ -727,6 +1083,18 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
 
         println!("SSH connectivity verified");
 
+        let fresh_install_context = if fresh_install_disk {
+            Some(prepare_fresh_install_disk(
+                sh,
+                &vm_name,
+                libvirt_connection
+                    .as_ref()
+                    .expect("fresh-install connection validated before VM launch"),
+            )?)
+        } else {
+            None
+        };
+
         let ssh_port_str = ssh_port.to_string();
 
         // Run tmt for this specific plan using connect provisioner
@@ -739,15 +1107,38 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         // Run tmt for this specific plan
         // Note: provision must come before plan for connect to work properly
         let context = context.clone();
-        let how = ["--how=connect", "--guest=localhost", "--user=root"];
-        let env = ["TMT_SCRIPTS_DIR=/var/lib/tmt/scripts", "BCVK_EXPORT=1"]
-            .into_iter()
-            .chain(args.env.iter().map(|v| v.as_str()))
-            .chain(tmt_env_vars.iter().map(|v| v.as_str()))
-            .flat_map(|v| ["--environment", v]);
+        let mut how = vec![
+            "--how=connect".to_string(),
+            "--guest=localhost".to_string(),
+            "--user=root".to_string(),
+        ];
+        if let Some(context_path) = fresh_install_context {
+            let helper = sh.current_dir().join("tmt/fresh-install-disk-reboot.sh");
+            let helper = std::fs::canonicalize(&helper).with_context(|| {
+                format!("Locating fresh-install disk reboot helper at {:?}", helper)
+            })?;
+            let context_path = context_path.canonicalize_utf8()?;
+            let reboot_command = fresh_install_soft_reboot_command(&helper, &context_path)?;
+            how.push(format!("--soft-reboot={reboot_command}"));
+        }
+        let backend_env = if args.composefs_backend {
+            "BOOTC_variant=composefs"
+        } else {
+            "BOOTC_variant=ostree"
+        };
+        let env = [
+            "TMT_SCRIPTS_DIR=/var/lib/tmt/scripts",
+            "BCVK_EXPORT=1",
+            backend_env,
+        ]
+        .into_iter()
+        .chain(args.env.iter().map(|v| v.as_str()))
+        .chain(tmt_env_vars.iter().map(|v| v.as_str()))
+        .flat_map(|v| ["--environment", v]);
+        let unsafe_behavior = tmt_unsafe_behavior_args(fresh_install_disk);
         let test_result = cmd!(
             sh,
-            "tmt {context...} run --id {run_id} --all {env...} provision {how...} --port {ssh_port_str} --key {key_path} plan --name {plan}"
+            "tmt {unsafe_behavior...} {context...} run --id {run_id} --all {env...} provision {how...} --port {ssh_port_str} --key {key_path} plan --name {plan}"
         )
         .run();
 
@@ -789,7 +1180,14 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
                     persistent_key_path, ssh_port_str
                 );
                 println!("\nTo cleanup:");
-                println!("  bcvk libvirt rm --stop --force {}", vm_name);
+                if let Some(connection) = &libvirt_connection {
+                    println!(
+                        "  bcvk libvirt --connect {} rm --stop --force {}",
+                        connection.uri, vm_name
+                    );
+                } else {
+                    println!("  bcvk libvirt rm --stop --force {}", vm_name);
+                }
                 println!("========================================\n");
             }
         }
@@ -900,7 +1298,7 @@ pub(crate) fn tmt_provision(sh: &Shell, args: &TmtProvisionArgs) -> Result<()> {
     println!("VM launched, waiting for SSH...");
 
     // Wait for VM to be ready and get SSH info
-    let (ssh_port, ssh_key) = wait_for_vm_ready(sh, &vm_name)?;
+    let (ssh_port, ssh_key) = wait_for_vm_ready(sh, &vm_name, None)?;
 
     // Save SSH private key to target directory
     let key_dir = Utf8Path::new("target");
@@ -1048,6 +1446,9 @@ struct TestDef {
     skip_if_ostree: bool,
     /// Whether to skip this test for images with UKI
     skip_if_uki: bool,
+    /// Install and boot a newly-attached disk; opt-in because it retains the
+    /// VM and disk for the runtime coordinator to inspect.
+    fresh_install_disk: bool,
     /// TMT fmf attributes to pass through (summary, duration, adjust, etc.)
     tmt: serde_yaml::Value,
 }
@@ -1229,6 +1630,17 @@ fn generate_integration() -> Result<(String, String)> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let fresh_install_disk = metadata
+            .extra
+            .as_mapping()
+            .and_then(|m| {
+                m.get(&serde_yaml::Value::String(
+                    FIELD_FRESH_INSTALL_DISK.to_string(),
+                ))
+            })
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         tests.push(TestDef {
             number: metadata.number,
             name: display_name,
@@ -1237,6 +1649,7 @@ fn generate_integration() -> Result<(String, String)> {
             skip_if_composefs,
             skip_if_ostree,
             skip_if_uki,
+            fresh_install_disk,
             tmt: metadata.tmt,
         });
     }
@@ -1379,6 +1792,13 @@ fn generate_integration() -> Result<(String, String)> {
             );
         }
 
+        if test.fresh_install_disk {
+            plan_value.insert(
+                serde_yaml::Value::String(format!("extra-{}", FIELD_FRESH_INSTALL_DISK)),
+                serde_yaml::Value::Bool(true),
+            );
+        }
+
         plans_mapping.insert(
             serde_yaml::Value::String(plan_key),
             serde_yaml::Value::Mapping(plan_value),
@@ -1431,6 +1851,7 @@ fn generate_integration() -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_boot_context_values() {
@@ -1445,6 +1866,81 @@ mod tests {
                 "--context=seal_state=unspecified"
             ]
         );
+    }
+
+    #[test]
+    fn test_libvirt_connection_validation_and_bcvk_argv() {
+        use std::os::unix::net::UnixListener;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let socket = tempdir.path().join("virtqemud.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let virsh = tempdir.path().join("virsh-fake");
+        std::fs::write(&virsh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&virsh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = socket.to_str().unwrap();
+        let virsh = virsh.to_str().unwrap();
+        let uri = format!("qemu+unix:///session?socket={socket}");
+        let connection = validate_libvirt_connection(&uri, virsh).unwrap();
+        assert_eq!(connection.uri, uri);
+        assert_eq!(connection.socket_path, socket);
+        assert_eq!(
+            bcvk_run_args(Some(&uri)),
+            ["libvirt", "--connect", uri.as_str(), "run"]
+        );
+        assert_eq!(bcvk_run_args(None), ["libvirt", "run"]);
+        assert!(
+            validate_libvirt_connection(
+                &format!("qemu+unix:///session?socket={socket}.missing"),
+                virsh
+            )
+            .is_err()
+        );
+        assert!(
+            validate_libvirt_connection(
+                &format!("qemu+unix:///session?socket={socket}&socket={socket}"),
+                virsh
+            )
+            .is_err()
+        );
+        assert!(
+            validate_libvirt_connection(&format!("qemu+unix:///other?socket={socket}"), virsh)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_fresh_install_soft_reboot_command_runs_mode_644_paths() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let helper = tempdir.path().join("reboot helper with 'quote'.sh");
+        let record = Utf8PathBuf::from(
+            tempdir
+                .path()
+                .join("record with spaces; touch injected 'record'")
+                .to_str()
+                .unwrap(),
+        );
+        let args_file = tempdir.path().join("args");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"$FRESH_INSTALL_ARGS\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let command = fresh_install_soft_reboot_command(&helper, &record).unwrap();
+        let status = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(&command)
+            .env("FRESH_INSTALL_ARGS", &args_file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(&args_file).unwrap(),
+            format!("{record}\n")
+        );
+        assert!(!tempdir.path().join("injected").exists());
     }
 
     #[test]
@@ -1559,6 +2055,102 @@ use std assert
             Some(&serde_yaml::Value::String(
                 "Execute local upgrade tests".to_string()
             ))
+        );
+    }
+
+    #[test]
+    fn test_parse_tmt_metadata_with_fresh_install_disk() {
+        let content = r#"# number: 50
+# extra:
+#   fresh_install_disk: true
+# tmt:
+#   summary: Verify a fresh installed boot
+#
+#!/bin/bash
+"#;
+        let metadata = parse_tmt_metadata(content).unwrap().unwrap();
+        assert_eq!(metadata.number, 50);
+        assert_eq!(
+            metadata
+                .extra
+                .as_mapping()
+                .unwrap()
+                .get(&serde_yaml::Value::String(
+                    FIELD_FRESH_INSTALL_DISK.to_string()
+                )),
+            Some(&serde_yaml::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_fresh_install_disk_record_roundtrip_and_rejects_malformed_json() {
+        let record = FreshInstallDiskRecord {
+            domain_name: "bootc-tmt-example".into(),
+            domain_uuid: "00000000-0000-0000-0000-000000000000".into(),
+            initial_disk: "/var/lib/libvirt/images/initial.raw".into(),
+            volume_name: "bootc-tmt-example-fresh-install.raw".into(),
+            pool_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            volume_key: "/var/lib/libvirt/images/fresh.raw".into(),
+            volume_path: "/var/lib/libvirt/images/fresh.raw".into(),
+            connection_uri: "qemu+unix:///session?socket=/run/user/1000/libvirt/virtqemud-sock"
+                .into(),
+            socket_path: "/run/user/1000/libvirt/virtqemud-sock".into(),
+            socket_dev: "1".into(),
+            socket_ino: "2".into(),
+            virsh_path: "/usr/bin/virsh".into(),
+            active_domain_id: "42".into(),
+        };
+        let serialized = serde_json::to_vec(&record).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<FreshInstallDiskRecord>(&serialized).unwrap(),
+            record
+        );
+        assert!(serde_json::from_str::<FreshInstallDiskRecord>("{\"domain_name\":42}").is_err());
+        // Raw storage-pool volumes intentionally have no UUID in virsh
+        // `vol-info`; identity comes from pool UUID, key, and path instead.
+        let raw_vol_info = "Name: fresh.raw\nType: file\nCapacity: 20.00 GiB\n";
+        assert!(!raw_vol_info.lines().any(|line| line.starts_with("UUID:")));
+    }
+
+    #[test]
+    fn test_fresh_install_record_uses_shell_current_dir() -> Result<()> {
+        let tempdir = tempfile::tempdir()?;
+        let sh = Shell::new()?;
+        let _cwd = sh.push_dir(tempdir.path());
+        let resources_dir = fresh_install_resources_dir(&sh)?;
+        assert!(resources_dir.is_absolute());
+        assert!(resources_dir.starts_with(Utf8Path::from_path(tempdir.path()).unwrap()));
+        sh.create_dir(&resources_dir)?;
+
+        let record_path = resources_dir.join("record.json");
+        let record = FreshInstallDiskRecord {
+            domain_name: "bootc-tmt-private".into(),
+            domain_uuid: "00000000-0000-0000-0000-000000000000".into(),
+            initial_disk: "/private/initial.raw".into(),
+            volume_name: "bootc-tmt-private-fresh-install.raw".into(),
+            pool_uuid: "11111111-1111-1111-1111-111111111111".into(),
+            volume_key: "/private/fresh.raw".into(),
+            volume_path: "/private/fresh.raw".into(),
+            connection_uri: "qemu+unix:///session?socket=/private/virtqemud-sock".into(),
+            socket_path: "/private/virtqemud-sock".into(),
+            socket_dev: "1".into(),
+            socket_ino: "2".into(),
+            virsh_path: "/usr/bin/virsh".into(),
+            active_domain_id: "42".into(),
+        };
+        write_fresh_install_disk_record(&record_path, &record)?;
+        let on_disk: FreshInstallDiskRecord =
+            serde_json::from_slice(&std::fs::read(&record_path)?)?;
+        assert_eq!(on_disk, record);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fresh_install_is_the_only_plan_granted_reboot_permission() {
+        assert!(tmt_unsafe_behavior_args(false).is_empty());
+        assert_eq!(
+            tmt_unsafe_behavior_args(true),
+            [TMT_CONNECT_REBOOT_UNSAFE_BEHAVIOR]
         );
     }
 }

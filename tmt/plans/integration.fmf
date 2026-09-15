@@ -72,7 +72,6 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-22-logically-bound-install
-  extra-fixme_skip_if_composefs: true
 
 /plan-23-install-outside-container:
   summary: Execute tests for installing outside of a container
@@ -331,4 +330,17 @@ execute:
     enabled: true
   extra-try_bind_storage: true
   extra-skip_if_ostree: true
+
+/plan-51-native-lbi-fresh-install:
+  summary: Verify native fresh install logical bound image modes
+  discover:
+    how: fmf
+    test:
+      - /tmt/tests/tests/test-51-native-lbi-fresh-install
+  adjust:
+  - when: native_lbi_fresh_install != true
+    enabled: false
+    because: this retains a VM and disk for runtime coordinator approval
+  extra-skip_if_ostree: true
+  extra-fresh_install_disk: true
 # END GENERATED PLANS
