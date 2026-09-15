@@ -28,11 +28,17 @@ mod bcvk 'bcvk.just'
 #   uki     → requires bootloader=systemd
 
 # Output image name (override with BOOTC_image to isolate worktree images)
-base_img := env("BOOTC_image", "localhost/bootc")
+image := env("BOOTC_image", "localhost/bootc")
+base_img := image
+# Package image and output directory.  Keep these derived from BOOTC_image so a
+# worktree can be isolated with one setting.
+package_img := env("BOOTC_package_image", base_img + "-pkg")
+packages_dir := env("BOOTC_packages_dir", "target/packages")
 # Synthetic upgrade image for testing
-upgrade_img := base_img + "-upgrade"
+upgrade_img := env("BOOTC_upgrade_image", base_img + "-upgrade")
 # Base image with tmt dependencies added, used as the boot source for upgrade tests
-upgrade_source_img := base_img + "-upgrade-source"
+upgrade_source_img := env("BOOTC_upgrade_source_image", base_img + "-upgrade-source")
+secureboot_dir := env("BOOTC_secureboot_dir", "target/test-secureboot")
 
 # Build variant: ostree (default) or composefs
 variant := env("BOOTC_variant", "ostree")
@@ -65,23 +71,40 @@ testimage_label := "bootc.testimage=1"
 lbi_images := "quay.io/curl/curl:latest quay.io/curl/curl-base:latest registry.access.redhat.com/ubi9/podman:latest"
 fedora-coreos := "quay.io/fedora/fedora-coreos:testing-devel"
 generic_buildargs := ""
-_extra_src_args := if extra_src != "" { "-v " + extra_src + ":/run/extra-src:ro --security-opt=label=disable" } else { "" }
+jobs := env("BOOTC_jobs", "")
+cpuset := env("BOOTC_cpuset", "")
+memory := env("BOOTC_memory", "")
+memory_swap := env("BOOTC_memory_swap", "")
+retain_containers := env("BOOTC_retain_containers", "")
+retain_containers_enabled := if retain_containers == "1" { "true" } else if retain_containers == "true" { "true" } else { "false" }
+logged_jobs := env("BOOTC_logged_jobs", if jobs != "" { jobs } else { "2" })
+logged_memory := env("BOOTC_logged_memory", if memory != "" { memory } else { "4g" })
+logged_retain_containers := if retain_containers != "" { retain_containers } else { "1" }
+_logged_env := "BOOTC_image=" + quote(base_img) + " BOOTC_base=" + quote(base) + " BOOTC_buildroot_base=" + quote(buildroot_base) + " BOOTC_package_image=" + quote(package_img) + " BOOTC_packages_dir=" + quote(packages_dir) + " BOOTC_upgrade_image=" + quote(upgrade_img) + " BOOTC_upgrade_source_image=" + quote(upgrade_source_img) + " BOOTC_secureboot_dir=" + quote(secureboot_dir) + " BOOTC_variant=" + quote(variant) + " BOOTC_bootloader=" + quote(bootloader) + " BOOTC_filesystem=" + quote(filesystem) + " BOOTC_boot_type=" + quote(boot_type) + " BOOTC_seal_state=" + quote(seal_state) + " BOOTC_erofs_version=" + quote(erofs_version) + " BOOTC_baseconfigs=" + quote(baseconfigs) + " BOOTC_extra_src=" + quote(extra_src) + " BOOTC_jobs=" + quote(logged_jobs) + " BOOTC_cpuset=" + quote(cpuset) + " BOOTC_memory=" + quote(logged_memory) + " BOOTC_memory_swap=" + quote(memory_swap) + " BOOTC_retain_containers=" + quote(logged_retain_containers)
+_extra_src_args := if extra_src != "" { "-v " + quote(extra_src + ":/run/extra-src:ro") + " --security-opt=label=disable" } else { "" }
+# CPU affinity is deliberately opt-in.  RPM's %{_smp_build_ncpus} controls the
+# cargo -j value, while cpuset constrains all build processes when requested.
+_resource_buildargs := if jobs != "" { " " + quote("--build-arg=RPM_BUILD_NCPUS=" + jobs) } else { "" }
+_resource_podman_args := (if cpuset != "" { " " + quote("--cpuset-cpus=" + cpuset) } else { "" }) + (if memory != "" { " " + quote("--memory=" + memory) } else { "" }) + (if memory_swap != "" { " " + quote("--memory-swap=" + memory_swap) } else { "" }) + (if retain_containers_enabled == "true" { " --rm=false --force-rm=false" } else { "" })
 # filesystem arg: required for bootc container ukify to allow missing fsverity
 # CARGO_INCREMENTAL is passed through as-is (CI sets it to 0); empty is a no-op,
 # leaving cargo's own profile defaults in effect in the Dockerfile.
 base_buildargs := generic_buildargs + " " + _extra_src_args \
-                  + " --build-arg=CARGO_INCREMENTAL=" + env("CARGO_INCREMENTAL", "") \
-                  + " --build-arg=base=" + base \
-                  + " --build-arg=variant=" + variant \
-                  + " --build-arg=bootloader=" + bootloader \
-                  + " --build-arg=boot_type=" + boot_type \
-                  + " --build-arg=seal_state=" + seal_state \
-                  + " --build-arg=filesystem=" + filesystem \
-                  + " --build-arg=erofs_version=" + erofs_version \
-                  + " --build-arg=baseconfigs=" + baseconfigs
+                   + " " + quote("--build-arg=CARGO_INCREMENTAL=" + env("CARGO_INCREMENTAL", "")) \
+                   + " " + quote("--build-arg=base=" + base) \
+                   + " " + quote("--build-arg=buildroot_base=" + buildroot_base) \
+                   + " " + quote("--build-arg=variant=" + variant) \
+                   + " " + quote("--build-arg=bootloader=" + bootloader) \
+                   + " " + quote("--build-arg=boot_type=" + boot_type) \
+                   + " " + quote("--build-arg=seal_state=" + seal_state) \
+                   + " " + quote("--build-arg=filesystem=" + filesystem) \
+                   + " " + quote("--build-arg=erofs_version=" + erofs_version) \
+                   + " " + quote("--build-arg=baseconfigs=" + baseconfigs) + _resource_buildargs + _resource_podman_args
 buildargs := base_buildargs \
-             + " --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse" \
-             + " --secret=id=secureboot_key,src=target/test-secureboot/db.key --secret=id=secureboot_cert,src=target/test-secureboot/db.crt"
+              + " --cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse" \
+              + " " + quote("--secret=id=secureboot_key,src=" + secureboot_dir + "/db.key") \
+              + " " + quote("--secret=id=secureboot_cert,src=" + secureboot_dir + "/db.crt")
+_libvirt_connect_arg := if env("BOOTC_libvirt_connect", "") != "" { quote("--libvirt-connect=" + env("BOOTC_libvirt_connect", "")) } else { "" }
 
 # ============================================================================
 # Core workflows - the main targets most developers will use
@@ -89,13 +112,15 @@ buildargs := base_buildargs \
 
 # Build container image from current sources (default target)
 [group('core')]
-build: package _keygen && _pull-lbi-images
+build: package _keygen _build-main-image && _pull-lbi-images
+
+_build-main-image:
     #!/bin/bash
     set -xeuo pipefail
-    test -d target/packages
-    pkg_path=$(realpath target/packages)
+    test -d "{{packages_dir}}"
+    pkg_path=$(realpath "{{packages_dir}}")
     eval $(just _git-build-vars)
-    podman build {{_nocache_arg}} --build-arg=image_version=${VERSION} --build-context "packages=${pkg_path}" -t {{base_img}} {{buildargs}} .
+    podman build {{_nocache_arg}} --build-arg=image_version=${VERSION} --build-context "packages=${pkg_path}" -t "{{base_img}}" {{buildargs}} .
 
 # Fetch all external dependencies with a retry loop.
 #
@@ -138,7 +163,7 @@ build-fetch: _keygen package
         retry podman pull -q "$img"
     done
 
-    pkg_path=$(realpath target/packages)
+    pkg_path=$(realpath "{{packages_dir}}")
 
     # Build the network-heavy fetch stage of the main image.  If this
     # succeeds, `just build` will get a cache hit on the fetch layer and
@@ -147,7 +172,7 @@ build-fetch: _keygen package
     # target-base stage requires --cap-add/--security-opt for bwrap.
     retry podman build {{_nocache_arg}} --build-context "packages=${pkg_path}" --target=fetch {{buildargs}} .
     # Same for the upgrade-source image used by test-upgrade.
-    retry podman build {{_nocache_arg}} --build-arg=base={{base}} \
+    retry podman build {{_nocache_arg}} --build-arg=base={{base}} --build-arg=variant={{variant}} {{base_buildargs}} \
         --target=fetch -f tmt/tests/Dockerfile.upgrade-source .
 
 # Show available build variants and current configuration
@@ -188,8 +213,8 @@ build-sealed:
 # Run tmt integration tests in VMs (e.g. `just test-tmt readonly`)
 [group('core')]
 test-tmt *ARGS: build
-    @just _build-upgrade-image
-    @just test-tmt-nobuild {{ARGS}}
+    @just build-upgrade
+    @env BOOTC_secureboot_dir={{quote(secureboot_dir)}} just test-tmt-nobuild {{ARGS}}
 
 # Split out from `test-container` because, unlike the container integration tests,
 # unit tests don't depend on variant/filesystem/bootloader/boot_type/seal_state, so
@@ -253,9 +278,11 @@ test-upgrade *ARGS: build _build-upgrade-source-image
             --karg=enforcing=0)
     fi
     cargo xtask run-tmt --env=BOOTC_variant={{variant}} \
+        {{quote("--secure-boot-keys=" + secureboot_dir)}} \
         --env=BOOTC_erofs_version={{erofs_version}} \
         --env=BOOTC_test_upgrade_image={{base_img}} \
         --upgrade-image={{base_img}} \
+        {{_libvirt_connect_arg}} \
         "${composefs_args[@]}" \
         {{upgrade_source_img}} {{ARGS}} readonly
 
@@ -294,7 +321,7 @@ test-container-export: build
 # Run tmt tests without rebuilding (for fast iteration)
 [group('testing')]
 test-tmt-nobuild *ARGS:
-    cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_erofs_version={{erofs_version}} {{_baseconfigs_env}} --upgrade-image={{upgrade_img}} {{base_img}} {{ARGS}}
+    cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_erofs_version={{erofs_version}} {{_baseconfigs_env}} {{_libvirt_connect_arg}} {{quote("--secure-boot-keys=" + secureboot_dir)}} --upgrade-image={{upgrade_img}} {{base_img}} {{ARGS}}
 
 # Run readonly tests with a baseconfig baked into the image at build time.
 # Requires composefs variant. Example: just variant=composefs test-tmt-baseconfig root-transient
@@ -306,7 +333,9 @@ test-tmt-baseconfig baseconfig *ARGS:
         --env=BOOTC_variant=composefs \
         --env=BOOTC_erofs_version={{erofs_version}} \
         --env=BOOTC_baseconfigs={{baseconfig}} \
+        {{quote("--secure-boot-keys=" + secureboot_dir)}} \
         --upgrade-image={{upgrade_img}} \
+        {{_libvirt_connect_arg}} \
         --composefs-backend \
         --bootloader={{bootloader}} \
         --filesystem={{filesystem}} \
@@ -324,7 +353,7 @@ test-baseconfigs *ARGS:
 # Run tmt tests on Fedora CoreOS
 [group('testing')]
 test-tmt-on-coreos *ARGS:
-    cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_target={{base_img}}-coreos:latest {{fedora-coreos}} {{ARGS}}
+    cargo xtask run-tmt --env=BOOTC_variant={{variant}} --env=BOOTC_target={{base_img}}-coreos:latest {{_libvirt_connect_arg}} {{quote("--secure-boot-keys=" + secureboot_dir)}} {{fedora-coreos}} {{ARGS}}
 
 # Run external container tests against localhost/bootc
 [group('testing')]
@@ -428,7 +457,7 @@ clean-local-images:
 package:
     #!/bin/bash
     set -xeuo pipefail
-    packages=target/packages
+    packages={{quote(packages_dir)}}
     if test -n "${BOOTC_SKIP_PACKAGE:-}"; then
         if test '!' -d "${packages}"; then
             echo "BOOTC_SKIP_PACKAGE is set, but missing ${packages}" 1>&2; exit 1
@@ -442,12 +471,33 @@ package:
     if [[ -z "{{no_auto_local_deps}}" ]]; then
         local_deps_args=$(cargo xtask local-rust-deps)
     fi
-    podman build {{base_buildargs}} --build-arg=SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} --build-arg=pkgversion=${VERSION} -t localhost/bootc-pkg --target=build $local_deps_args .
+    podman build {{base_buildargs}} --build-arg=SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} --build-arg=pkgversion=${VERSION} -t {{quote(package_img)}} --target=build $local_deps_args .
     mkdir -p "${packages}"
-    rm -vf "${packages}"/*.rpm
-    podman run --rm localhost/bootc-pkg tar -C /out/ -cf - . | tar -C "${packages}"/ -xvf -
-    chmod a+rx target "${packages}"
-    chmod a+r "${packages}"/*.rpm
+    # Only replace RPMs managed by this project; preserve unrelated files in an
+    # explicitly overridden directory.
+    rm -vf "${packages}"/bootc-*.rpm
+    run_args=(--rm)
+    if test "{{retain_containers_enabled}}" = true; then
+        if test -n "${BOOTC_RUN_LOG_DIR:-}"; then
+            run_dir="${BOOTC_RUN_LOG_DIR}"
+        else
+            mkdir -p target/run
+            run_dir=$(mktemp -d target/run/package-extraction.XXXXXX)
+        fi
+        cidfile="${run_dir}/package-extraction.cid"
+        if test -e "${cidfile}"; then
+            echo "Refusing to reuse package extraction CID file: ${cidfile}" >&2
+            exit 1
+        fi
+        run_args=(--cidfile "${cidfile}")
+        echo "Retaining package extraction container; CID file: ${cidfile}"
+    fi
+    set +e
+    podman run "${run_args[@]}" {{quote(package_img)}} tar -C /out/ -cf - . | tar -C "${packages}"/ -xvf -
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+    if (( statuses[1] != 0 )); then exit "${statuses[1]}"; fi
 
 # Build unit tests into a container image
 [group('maintenance')]
@@ -498,7 +548,11 @@ _local-deps-args:
     fi
 
 _keygen:
-    ./hack/generate-secureboot-keys
+    BOOTC_SECUREBOOT_DIR={{quote(secureboot_dir)}} ./hack/generate-secureboot-keys
+
+# Build the synthetic upgrade image without rebuilding packages or the main image.
+[group('core')]
+build-upgrade: _keygen _build-upgrade-image
 
 _build-upgrade-image:
     #!/bin/bash
@@ -510,21 +564,45 @@ _build-upgrade-image:
         extra_args+=(--cap-add=all --security-opt=label=type:container_runtime_t --device /dev/fuse)
     fi
     podman build \
-        --build-arg "boot_type={{boot_type}}" \
-        --build-arg "seal_state={{seal_state}}" \
-        --build-arg "filesystem={{filesystem}}" \
-        --build-arg "base={{base_img}}" \
-        --build-arg "erofs_version={{erofs_version}}" \
-        --secret=id=secureboot_key,src=target/test-secureboot/db.key \
-        --secret=id=secureboot_cert,src=target/test-secureboot/db.crt \
+        {{quote("--build-arg=boot_type=" + boot_type)}} \
+        {{quote("--build-arg=seal_state=" + seal_state)}} \
+        {{quote("--build-arg=filesystem=" + filesystem)}} \
+        {{quote("--build-arg=base=" + base_img)}} \
+        {{quote("--build-arg=erofs_version=" + erofs_version)}} \
+        {{quote("--secret=id=secureboot_key,src=" + secureboot_dir + "/db.key")}} \
+        {{quote("--secret=id=secureboot_cert,src=" + secureboot_dir + "/db.crt")}} \
+        {{_resource_buildargs}} {{_resource_podman_args}} \
         "${extra_args[@]}" \
-        -t {{upgrade_img}} \
+        -t "{{upgrade_img}}" \
         -f tmt/tests/Dockerfile.upgrade \
         .
 
 # Build the upgrade source image: base image + tmt dependencies (rsync, nu, cloud-init)
 _build-upgrade-source-image:
-    podman build --build-arg=base={{base}} --build-arg=variant={{variant}} -t {{upgrade_source_img}} -f tmt/tests/Dockerfile.upgrade-source .
+    podman build {{quote("--build-arg=base=" + base)}} {{quote("--build-arg=variant=" + variant)}} {{base_buildargs}} -t {{quote(upgrade_source_img)}} -f tmt/tests/Dockerfile.upgrade-source .
+
+# Logged wrappers retain their containers and use modest defaults; ordinary
+# recipes and CI remain unchanged.  BOOTC_log_root may select another root.
+[group('core')]
+package-logged:
+    @env {{_logged_env}} cargo run -q -p xtask -- run-logged --timeout=2h -- just package
+
+[group('core')]
+build-logged:
+    @env {{_logged_env}} cargo run -q -p xtask -- run-logged --timeout=2h -- just build
+
+[group('core')]
+build-upgrade-logged:
+    @env {{_logged_env}} cargo run -q -p xtask -- run-logged --timeout=2h -- just build-upgrade
+
+[group('testing')]
+test-tmt-logged *ARGS:
+    @env {{_logged_env}} cargo run -q -p xtask -- run-logged --timeout=3h -- just test-tmt --preserve-vm {{ARGS}}
+
+# Run TMT using already-built images; use this after separate logged builds.
+[group('testing')]
+test-tmt-nobuild-logged *ARGS:
+    @env {{_logged_env}} cargo run -q -p xtask -- run-logged --timeout=3h -- just test-tmt-nobuild --preserve-vm {{ARGS}}
 
 # Copy an image from user podman storage to root's podman storage
 # This allows building as regular user then running privileged tests

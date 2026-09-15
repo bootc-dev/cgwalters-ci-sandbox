@@ -4,6 +4,7 @@
 
 # Note this is usually overridden via Justfile
 ARG base=quay.io/centos-bootc/centos-bootc:stream10
+ARG buildroot_base=${base}
 
 # This first image captures a snapshot of the source code,
 # note all the exclusions in .dockerignore.
@@ -18,13 +19,14 @@ COPY contrib/packaging /
 # This image installs build deps, pulls in our source code, and installs updated
 # bootc binaries in /out. The intention is that the target rootfs is extracted from /out
 # back into a final stage (without the build deps etc) below.
-FROM $base as buildroot
+FROM $buildroot_base as buildroot
 # Flip this off to disable initramfs code
 ARG initramfs=1
 # CI passes --build-arg=CARGO_INCREMENTAL=0 to save disk in the build cache.
 # When unset (local dev), cargo uses its profile defaults.
 ARG CARGO_INCREMENTAL
 ENV CARGO_INCREMENTAL=${CARGO_INCREMENTAL}
+ARG RPM_BUILD_NCPUS
 # This installs our buildroot, and we want to cache it independently of the rest.
 # Basically we don't want changing a .rs file to blow out the cache of packages.
 # Use tmpfs for /run and /tmp with bind mounts inside to avoid leaking mount stubs into the image
@@ -223,6 +225,7 @@ RUN --network=none --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp
 FROM buildroot as build
 # Version for RPM build (optional, computed from git in Justfile)
 ARG pkgversion
+ARG RPM_BUILD_NCPUS
 # For reproducible builds, SOURCE_DATE_EPOCH must be exported as ENV for rpmbuild to see it
 ARG SOURCE_DATE_EPOCH
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
@@ -230,7 +233,7 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 RUN --network=none --mount=type=tmpfs,target=/run --mount=type=tmpfs,target=/tmp \
     --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/var/roothome \
-    RPM_VERSION="${pkgversion}" /src/contrib/packaging/build-rpm
+    RPM_VERSION="${pkgversion}" RPM_BUILD_NCPUS="${RPM_BUILD_NCPUS}" /src/contrib/packaging/build-rpm
 
 # Build a systemd-sysext containing just the bootc binary.
 # Skips RPM machinery entirely for fast incremental rebuilds.

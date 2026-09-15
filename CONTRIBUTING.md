@@ -88,6 +88,33 @@ To run a specific test:
 just test-tmt readonly
 ```
 
+### Logged build and test runs
+
+For a reusable, resource-bounded developer run, set one image name and use a
+logged wrapper. Each wrapper prints its per-run log path and leaves failed
+containers and logs available for diagnosis:
+
+```bash
+export BOOTC_image=localhost/bootc-my-change
+just build-logged
+just build-upgrade-logged
+just test-tmt-nobuild-logged readonly
+```
+
+Use `test-tmt-logged` when a complete build-and-test cycle is intended; after
+the separate builds above, the `-nobuild-logged` form avoids rebuilding them.
+
+The wrappers default to two RPM compiler jobs, 4 GiB of build memory, retained
+build containers, and preserved TMT VMs without changing ordinary recipes or
+CI. Existing `BOOTC_jobs`, `BOOTC_memory`, and `BOOTC_retain_containers` values
+are preserved; `BOOTC_logged_jobs` and `BOOTC_logged_memory` override them for
+one logged run. Use `BOOTC_cpuset` only when explicit CPU affinity is needed.
+Logs are private directories under `target/run/` (or `BOOTC_log_root`). Logged
+TMT runs place `TMT_LOG_DIR` in that unique directory; ordinary TMT recipes
+continue to honor a caller-provided `TMT_LOG_DIR`. Logs capture child output
+verbatim, so commands must not print secret values. To inspect a failed TMT
+run, use the `tmt run -i … report -vvv` command printed by xtask.
+
 ### Faster iteration cycles
 
 The test cycle currently builds a disk image and creates a new ephemeral

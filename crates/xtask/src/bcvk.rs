@@ -5,25 +5,39 @@
 //! module centralises that logic so the two code paths stay in sync.
 
 use anyhow::Result;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use fn_error_context::context;
 
 use crate::{Bootloader, SealState};
 
 /// Default directory for secure boot test keys.
-const DEFAULT_SB_KEYS_DIR: &str = "target/test-secureboot";
+pub(crate) const DEFAULT_SB_KEYS_DIR: &str = "target/test-secureboot";
 
 /// Resolved bcvk install options, ready to be turned into CLI args.
 ///
 /// Construct via [`BcvkInstallOpts::from_env`] (reads `BOOTC_*` env vars)
 /// or populate fields directly.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct BcvkInstallOpts {
     pub(crate) composefs_backend: bool,
     pub(crate) bootloader: Option<Bootloader>,
     pub(crate) filesystem: Option<String>,
     pub(crate) seal_state: Option<SealState>,
     pub(crate) kargs: Vec<String>,
+    pub(crate) secure_boot_keys: Option<Utf8PathBuf>,
+}
+
+impl Default for BcvkInstallOpts {
+    fn default() -> Self {
+        Self {
+            composefs_backend: false,
+            bootloader: None,
+            filesystem: None,
+            seal_state: None,
+            kargs: Vec::new(),
+            secure_boot_keys: None,
+        }
+    }
 }
 
 impl BcvkInstallOpts {
@@ -52,6 +66,10 @@ impl BcvkInstallOpts {
                 "unsealed" => Some(SealState::Unsealed),
                 _ => None,
             });
+        let secure_boot_keys = std::env::var("BOOTC_secureboot_dir")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(Utf8PathBuf::from);
 
         Self {
             composefs_backend,
@@ -59,6 +77,7 @@ impl BcvkInstallOpts {
             filesystem,
             seal_state,
             kargs: Vec::new(),
+            secure_boot_keys,
         }
     }
 
@@ -90,13 +109,19 @@ impl BcvkInstallOpts {
             .is_some_and(|s| *s == SealState::Sealed)
     }
 
+    fn secure_boot_keys_dir(&self) -> &Utf8Path {
+        self.secure_boot_keys
+            .as_deref()
+            .unwrap_or_else(|| Utf8Path::new(DEFAULT_SB_KEYS_DIR))
+    }
+
     /// Return firmware / secure-boot args for `bcvk libvirt run`.
     ///
     /// For sealed images the secure boot keys directory must already
     /// exist; the caller can use `ensure_secureboot_keys` first.
     #[context("Building firmware arguments")]
     pub(crate) fn firmware_args(&self) -> Result<Vec<String>> {
-        let sb_keys_dir = Utf8Path::new(DEFAULT_SB_KEYS_DIR);
+        let sb_keys_dir = self.secure_boot_keys_dir();
         if self.is_sealed() {
             if sb_keys_dir.try_exists()? {
                 let sb_keys_dir = sb_keys_dir.canonicalize_utf8()?;
@@ -119,5 +144,56 @@ impl BcvkInstallOpts {
             // custom test keys and use a test-signed systemd-boot.
             Ok(vec!["--firmware=uefi-insecure".into()])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sealed(keys: Option<Utf8PathBuf>) -> BcvkInstallOpts {
+        BcvkInstallOpts {
+            seal_state: Some(SealState::Sealed),
+            secure_boot_keys: keys,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn firmware_args_use_configured_keys_without_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Utf8PathBuf::from_path_buf(temp.path().join("keys")).unwrap();
+        std::fs::create_dir(&keys).unwrap();
+        let args = sealed(Some(keys.clone())).firmware_args().unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "--firmware=uefi-secure".to_owned(),
+                format!("--secure-boot-keys={}", keys.canonicalize_utf8().unwrap())
+            ]
+        );
+    }
+
+    #[test]
+    fn firmware_args_report_missing_configured_keys_and_skip_unsealed_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = Utf8PathBuf::from_path_buf(temp.path().join("missing")).unwrap();
+        let error = sealed(Some(missing.clone())).firmware_args().unwrap_err();
+        assert!(format!("{error:#}").contains(missing.as_str()));
+        let args = BcvkInstallOpts {
+            secure_boot_keys: Some(missing),
+            ..Default::default()
+        }
+        .firmware_args()
+        .unwrap();
+        assert_eq!(args, vec!["--firmware=uefi-insecure".to_owned()]);
+    }
+
+    #[test]
+    fn defaults_to_the_existing_secure_boot_key_directory() {
+        assert_eq!(
+            BcvkInstallOpts::default().secure_boot_keys_dir(),
+            Utf8Path::new(DEFAULT_SB_KEYS_DIR)
+        );
     }
 }

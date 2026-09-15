@@ -698,6 +698,7 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
         filesystem: args.filesystem.clone(),
         seal_state: args.seal_state.clone(),
         kargs: args.karg.clone(),
+        secure_boot_keys: Some(args.secure_boot_keys.clone()),
     };
     let firmware_args = bcvk_opts.firmware_args()?;
 
@@ -1203,47 +1204,25 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
     }
     println!("========================================\n");
 
-    // Print detailed error reports for failed tests
+    // Keep tmt's complete run directory intact, but do not automatically invoke
+    // a second, verbose report command after a failure.  It can obscure the
+    // original failure and makes diagnosis unexpectedly expensive.
     let failed_tests: Vec<_> = test_results
         .iter()
         .filter(|(_, passed, _)| !passed)
         .collect();
 
     if !failed_tests.is_empty() {
-        println!("\n========================================");
-        println!("Detailed Error Reports");
-        println!("========================================\n");
+        println!("\nFailed TMT runs (logs are retained):");
 
         for (plan, _, run_id) in failed_tests {
-            println!("----------------------------------------");
-            println!("Plan: {}", plan);
-            println!("----------------------------------------");
-
             if let Some(id) = run_id {
-                println!("Run ID: {}\n", id);
-
-                // Run tmt with the specific run ID and generate verbose report
-                let report_result = cmd!(sh, "tmt run -i {id} report -vvv")
-                    .ignore_status()
-                    .run();
-
-                match report_result {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to generate detailed report for {}: {:#}",
-                            plan, e
-                        );
-                    }
-                }
+                println!("  {plan}: tmt run -i {id} report -vvv");
             } else {
-                println!("Run ID not available - cannot generate detailed report");
+                println!("  {plan}: run ID unavailable; see the TMT log directory above");
             }
-
-            println!("\n");
         }
-
-        println!("========================================\n");
+        println!();
     }
 
     if !all_passed {
@@ -1281,7 +1260,7 @@ pub(crate) fn tmt_provision(sh: &Shell, args: &TmtProvisionArgs) -> Result<()> {
         } else {
             None
         },
-        ..Default::default()
+        ..BcvkInstallOpts::from_env()
     };
     let firmware_args = provision_opts.firmware_args()?;
 
