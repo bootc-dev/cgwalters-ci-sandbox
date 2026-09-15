@@ -14,6 +14,9 @@ jobs:
     runs-on: rhel10-x86_64-16c-64g
     timeout-minutes: 25
     steps:
+      - name: Install Tailscale networking prerequisite
+        run: sudo dnf install -y iptables
+
       - name: Connect to Tailscale
         uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
         with:
