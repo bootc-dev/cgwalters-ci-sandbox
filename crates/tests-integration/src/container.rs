@@ -3,7 +3,7 @@ use cap_std_ext::cap_std::fs::Dir;
 use indoc::indoc;
 use scopeguard::defer;
 use serde::Deserialize;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
@@ -356,10 +356,43 @@ pub(crate) fn test_compute_composefs_digest() -> Result<()> {
 /// Verifies that:
 /// - `compute-composefs-digest --erofs-version=v1` and `=v2` produce distinct,
 ///   valid 128-char SHA-512 hex digests (different EROFS layouts → different IDs).
-/// - `bootc container ukify --erofs-version=v1` either invokes ukify (skipping
-///   gracefully if ukify is absent) or fails with a clear error before ukify.
+/// - a synthetic non-archive initramfs is rejected by the automatic capability
+///   probe before it can be handed to ukify.
 pub(crate) fn test_container_ukify_erofs_versions() -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+
+    const MARKER: &str = "usr/lib/bootc/initramfs-features/composefs-digest-v1";
+    const MARKER_CONTENT: &[u8] = b"composefs-digest-v1 state-v1\n";
+
+    fn write_cpio_initramfs(path: &Path, marker: Option<&[u8]>) -> Result<()> {
+        let source = tempfile::tempdir()?;
+        fs::create_dir_all(source.path().join("etc"))?;
+        fs::write(source.path().join("etc/legacy"), b"legacy\n")?;
+        let mut filenames = b"etc/legacy\0".to_vec();
+        if let Some(marker) = marker {
+            let marker_path = source.path().join(MARKER);
+            fs::create_dir_all(marker_path.parent().expect("marker has a parent"))?;
+            fs::write(marker_path, marker)?;
+            filenames.extend_from_slice(MARKER.as_bytes());
+            filenames.push(0);
+        }
+        let mut cpio = Command::new("cpio");
+        cpio.current_dir(source.path())
+            .args(["--create", "--format=newc", "--null"])
+            .stdin(Stdio::piped())
+            .stdout(fs::File::create(path)?);
+        let mut child = cpio.spawn().context("Creating CPIO initramfs fixture")?;
+        child
+            .stdin
+            .take()
+            .expect("stdin was requested")
+            .write_all(&filenames)?;
+        anyhow::ensure!(
+            child.wait()?.success(),
+            "Creating CPIO initramfs fixture failed"
+        );
+        Ok(())
+    }
 
     // Build a minimal rootfs that satisfies find_kernel() and build_ukify()'s
     // existence checks.  The files don't need to be real ELF/CPIO — bootc only
@@ -381,7 +414,8 @@ pub(crate) fn test_container_ukify_erofs_versions() -> Result<()> {
     let mod_dir = root.join("usr/lib/modules").join(kver);
     fs::create_dir_all(&mod_dir)?;
     fs::write(mod_dir.join("vmlinuz"), b"fake-vmlinuz")?;
-    fs::write(mod_dir.join("initramfs.img"), b"fake-initramfs")?;
+    let initramfs = mod_dir.join("initramfs.img");
+    write_cpio_initramfs(&initramfs, None)?;
 
     // ukify reads --os-release @usr/lib/os-release relative to the rootfs cwd
     let os_release_dir = root.join("usr/lib");
@@ -433,12 +467,8 @@ pub(crate) fn test_container_ukify_erofs_versions() -> Result<()> {
         "V1 and V2 EROFS digests must differ (they use different on-disk layouts)"
     );
 
-    // ── Part 2: smoke-test the full ukify CLI path with --erofs-version=v1 ────
-    //
-    // We don't assert success because ukify will fail on fake kernel blobs.
-    // What we're testing is that bootc reaches the ukify invocation stage —
-    // i.e. the --erofs-version plumbing is wired correctly all the way through.
-    let output = Command::new("bootc")
+    // ── Part 2: exercise the real lsinitrd probe through the CLI ──────────────
+    let legacy_v1 = Command::new("bootc")
         .args([
             "container",
             "ukify",
@@ -446,27 +476,86 @@ pub(crate) fn test_container_ukify_erofs_versions() -> Result<()> {
             root_str,
             "--erofs-version=v1",
             "--allow-missing-verity",
-            "--",
-            "--output=/dev/null",
         ])
         .output()?;
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if stderr.contains("ukify executable not found in PATH") {
-        // ukify binary absent: the CLI plumbing still ran up to that check.
-        eprintln!("note: ukify not found, skipping ukify invocation check");
-        return Ok(());
-    }
-
-    // ukify was found and invoked.  It will fail because of the fake kernel
-    // blobs, but bootc must have reached the `ukify build` invocation, which
-    // means the V1 digest was computed and the cmdline assembled.  Assert that
-    // no *bootc* logic bailed before reaching ukify (i.e. no "No kernel found",
-    // "already contains a UKI", or similar early exits).
     assert!(
-        !stderr.contains("No kernel found") && !stderr.contains("already contains a UKI"),
-        "bootc bailed before reaching ukify; stderr:\n{stderr}"
+        !legacy_v1.status.success()
+            && String::from_utf8_lossy(&legacy_v1.stderr).contains("--erofs-version=v1 requires"),
+        "explicit V1 did not reject a valid legacy initramfs: {}",
+        String::from_utf8_lossy(&legacy_v1.stderr)
+    );
+
+    fs::write(&initramfs, b"corrupt initramfs")?;
+    let corrupt_auto = Command::new("bootc")
+        .args(["container", "ukify", "--rootfs", root_str])
+        .output()?;
+    assert!(
+        !corrupt_auto.status.success()
+            && String::from_utf8_lossy(&corrupt_auto.stderr).contains("Validating initramfs"),
+        "auto mode did not reject a corrupt initramfs: {}",
+        String::from_utf8_lossy(&corrupt_auto.stderr)
+    );
+
+    write_cpio_initramfs(&initramfs, Some(b"bad marker\n"))?;
+    let bad_marker = Command::new("bootc")
+        .args(["container", "ukify", "--rootfs", root_str])
+        .output()?;
+    assert!(
+        !bad_marker.status.success()
+            && String::from_utf8_lossy(&bad_marker.stderr)
+                .contains("unexpected composefs V1 capability marker"),
+        "auto mode did not reject a bad marker: {}",
+        String::from_utf8_lossy(&bad_marker.stderr)
+    );
+
+    let fake_bin = td.path().join("fake-bin");
+    fs::create_dir(&fake_bin)?;
+    let fake_ukify = fake_bin.join("ukify");
+    fs::write(
+        &fake_ukify,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$UKIFY_ARGS\"\n",
+    )?;
+    fs::set_permissions(&fake_ukify, fs::Permissions::from_mode(0o755))?;
+    let ukify_args = td.path().join("ukify-args");
+    let path_with_fake_ukify = format!("{}:{}", fake_bin.display(), std::env::var("PATH")?);
+
+    write_cpio_initramfs(&initramfs, Some(MARKER_CONTENT))?;
+    let capable_auto = Command::new("bootc")
+        .env("PATH", &path_with_fake_ukify)
+        .env("UKIFY_ARGS", &ukify_args)
+        .args(["container", "ukify", "--rootfs", root_str])
+        .output()?;
+    assert!(
+        capable_auto.status.success(),
+        "auto mode failed for a capable initramfs: {}",
+        String::from_utf8_lossy(&capable_auto.stderr)
+    );
+    let args = fs::read_to_string(&ukify_args)?;
+    let cmdline = args
+        .lines()
+        .skip_while(|arg| *arg != "--cmdline")
+        .nth(1)
+        .context("fake ukify did not receive --cmdline")?;
+    let v1 = cmdline.find("composefs.digest=v1-sha512-12:").unwrap();
+    let v2 = cmdline.find("composefs=").unwrap();
+    assert!(v1 < v2, "expected ordered V1 then V2 kargs: {cmdline}");
+
+    fs::write(&initramfs, b"corrupt initramfs")?;
+    let explicit_v2 = Command::new("bootc")
+        .env("PATH", &path_with_fake_ukify)
+        .env("UKIFY_ARGS", &ukify_args)
+        .args([
+            "container",
+            "ukify",
+            "--rootfs",
+            root_str,
+            "--erofs-version=v2",
+        ])
+        .output()?;
+    assert!(
+        explicit_v2.status.success(),
+        "explicit V2 unexpectedly probed the initramfs: {}",
+        String::from_utf8_lossy(&explicit_v2.stderr)
     );
 
     Ok(())
