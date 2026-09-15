@@ -5,6 +5,7 @@ set -xeuo pipefail
 # Version can be passed via RPM_VERSION env var (set by Dockerfile ARG)
 # or defaults to the hardcoded value in the spec file
 VERSION="${RPM_VERSION:-}"
+RPM_BUILD_NCPUS="${RPM_BUILD_NCPUS:-}"
 
 # Determine output directory (defaults to /out)
 OUTPUT_DIR="${1:-/out}"
@@ -33,6 +34,11 @@ fi
 # - use_source_date_epoch_as_buildtime: RPM build timestamp uses SOURCE_DATE_EPOCH
 # - clamp_mtime_to_source_date_epoch: file mtimes clamped to SOURCE_DATE_EPOCH
 # - _buildhost: fixed hostname for consistent RPM metadata
+rpm_build_args=()
+if [ -n "${RPM_BUILD_NCPUS}" ]; then
+  rpm_build_args+=(--define "_smp_build_ncpus ${RPM_BUILD_NCPUS}")
+fi
+
 rpmbuild -bb \
   --define "_topdir /tmp/rpmbuild" \
   --define "_builddir ${SRC_DIR}" \
@@ -42,6 +48,7 @@ rpmbuild -bb \
   --define "_buildhost reproducible" \
   --with tests \
   --nocheck \
+  "${rpm_build_args[@]}" \
   "${SPEC_FILE}"
 
 # Copy built RPMs to output directory
