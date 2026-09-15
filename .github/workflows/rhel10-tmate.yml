@@ -1,0 +1,71 @@
+name: RHEL 10 tmate investigation
+
+on:
+  push:
+    branches: [test-bootc-rhel10-tmate]
+
+permissions:
+  contents: read
+
+jobs:
+  investigate:
+    name: RHEL 10 tmate investigation
+    runs-on: rhel10-x86_64-16c-64g
+    timeout-minutes: 45
+    steps:
+      - name: Bootstrap RHEL tools
+        run: sudo dnf install -y git-core podman curl tar gzip gcc
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # cgwalters-bot has no public GitHub SSH key, so actor-only access cannot
+      # authenticate from this shell.  This temporary, secret-free branch uses
+      # the documented SSH-address mode; the address is a bearer secret.
+      - name: Start tmate session
+        id: tmate
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113
+        with:
+          install-dependencies: true
+          limit-access-to-actor: false
+          detached: true
+          connect-timeout-seconds: 600
+
+      - name: Test SSH connection
+        env:
+          TMATE_SSH_ADDRESS: ${{ steps.tmate.outputs.ssh-address }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TMATE_SSH_ADDRESS"
+          test -n "$TMATE_SSH_ADDRESS"
+          ssh_opts=(-tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30)
+          # The single-quoted command is intentionally evaluated on the runner.
+          # shellcheck disable=SC2016
+          timeout --signal=TERM --kill-after=10s 90s \
+            ssh "${ssh_opts[@]}" "$TMATE_SSH_ADDRESS" \
+            'uname -a; id; pwd; printf "hostname=%s runner_name=%s\n" "$(hostname)" "${RUNNER_NAME:-unset}"'
+
+      - name: Run bounded remote diagnostics
+        if: always()
+        env:
+          TMATE_SSH_ADDRESS: ${{ steps.tmate.outputs.ssh-address }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TMATE_SSH_ADDRESS"
+          test -n "$TMATE_SSH_ADDRESS"
+          ssh_opts=(-tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=30)
+          # The single-quoted command is intentionally evaluated on the runner.
+          # shellcheck disable=SC2016
+          timeout --signal=TERM --kill-after=10s 120s \
+            ssh "${ssh_opts[@]}" "$TMATE_SSH_ADDRESS" 'set -e
+              printf "remote hostname=%s runner_name=%s\n" "$(hostname)" "${RUNNER_NAME:-unset}"
+              test -d "$GITHUB_WORKSPACE"
+              cd "$GITHUB_WORKSPACE"
+              git status --short --branch
+              podman --version'
+
+      - name: Terminate tmate session
+        if: always()
+        run: /tmp/tmate/tmate -S /tmp/tmate.sock kill-session -a || true
