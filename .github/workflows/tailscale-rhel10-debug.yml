@@ -1,0 +1,42 @@
+name: Tailscale RHEL 10 debug access
+
+on:
+  push:
+    branches:
+      - test-bootc-rhel10-tailscale
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  debug-access:
+    runs-on: rhel10-x86_64-16c-64g
+    timeout-minutes: 25
+    steps:
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:ci-debug
+
+      - name: Enable Tailscale SSH
+        run: sudo tailscale set --ssh
+
+      - name: Report safe connection diagnostics
+        run: |
+          set -euo pipefail
+          tailscale status
+          printf 'IPv4: '
+          tailscale ip -4
+          printf 'Hostname: '
+          hostname
+
+      - name: Keep runner available for debugging
+        run: |
+          set -euo pipefail
+          for elapsed in $(seq 0 540 20); do
+            printf 'Debug access remains available (%ss elapsed)\n' "$elapsed"
+            sleep 20
+          done
