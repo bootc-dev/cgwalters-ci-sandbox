@@ -27,7 +27,7 @@ jobs:
         with:
           oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
           audience: ${{ vars.TS_AUDIENCE }}
-          tags: tag:ci-debug
+          tags: tag:bootc-dev-sandbox
 
       - name: Enable Tailscale SSH
         run: sudo tailscale set --ssh
