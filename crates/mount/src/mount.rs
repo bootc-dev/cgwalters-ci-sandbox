@@ -53,6 +53,8 @@ pub struct Filesystem {
     pub options: String,
     /// The filesystem UUID, if available.
     pub uuid: Option<String>,
+    /// Kernel mount ID, if reported by findmnt.
+    pub id: Option<u64>,
     /// Child filesystems, if any.
     pub children: Option<Vec<Filesystem>>,
 }
@@ -74,7 +76,7 @@ pub fn run_findmnt(args: &[&str], cwd: Option<&Dir>, path: Option<&str>) -> Resu
         "-J",
         "-v",
         // If you change this you probably also want to change the Filesystem struct above
-        "--output=SOURCE,TARGET,MAJ:MIN,FSTYPE,OPTIONS,UUID",
+        "--output=SOURCE,TARGET,MAJ:MIN,FSTYPE,OPTIONS,UUID,ID",
     ])
     .args(args)
     .args(path);
@@ -379,6 +381,7 @@ mod tests {
             fstype: "ext4".into(),
             options: "rw".into(),
             uuid: None,
+            id: None,
             children: if children.is_empty() {
                 None
             } else {

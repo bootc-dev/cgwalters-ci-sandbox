@@ -83,6 +83,7 @@ pub(crate) fn run_alongside(image: &str, mut testargs: libtest_mimic::Arguments)
 
     let tests = [
         Trial::test("loopback install", move || {
+            // TODO: Port/generalize these install tests to run inside the bcvk to-disk TMT infrastructure.
             let sh = &xshell::Shell::new()?;
             reset_root(sh, image)?;
             let size = 10 * 1000 * 1000 * 1000;

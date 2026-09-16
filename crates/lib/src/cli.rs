@@ -303,6 +303,10 @@ pub(crate) struct UsrOverlayOpts {
 
 #[derive(Debug, clap::Subcommand, PartialEq, Eq)]
 pub(crate) enum InstallOpts {
+    /// Mount an installed deployment into a caller-owned directory.
+    Mount(crate::mount::MountOpts),
+    /// Unmount a deployment previously mounted by `install mount`.
+    Unmount(crate::mount::UnmountOpts),
     /// Install to the target block device.
     ///
     /// This command must be invoked inside of the container, which will be
@@ -734,7 +738,7 @@ pub(crate) enum SelinuxOpts {
     },
 }
 
-fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBuf, String> {
+pub(crate) fn parse_absolute_path(value: &str) -> std::result::Result<Utf8PathBuf, String> {
     let path = Utf8PathBuf::from(value);
     if path.is_absolute() {
         Ok(path)
@@ -2294,6 +2298,8 @@ async fn run_from_opt(opt: Opt) -> Result<CliExitStatus> {
             }
         },
         Opt::Install(opts) => match opts {
+            InstallOpts::Mount(opts) => crate::mount::mount(opts).await,
+            InstallOpts::Unmount(opts) => crate::mount::unmount(opts).await,
             #[cfg(feature = "install-to-disk")]
             InstallOpts::ToDisk(opts) => crate::install::install_to_disk(opts).await,
             InstallOpts::ToFilesystem(opts) => {

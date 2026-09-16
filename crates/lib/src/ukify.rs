@@ -65,7 +65,7 @@ where
         .with_context(|| format!("Reading composefs capability from initramfs {initramfs}"))?;
     let marker_listed = archive
         .stdout
-        .windows(COMPOSEFS_DIGEST_V1_FEATURE.len())
+        .windows(COMPOSEFS_DIGEST_V1_FEATURE.as_bytes().len())
         .any(|entry| entry == COMPOSEFS_DIGEST_V1_FEATURE.as_bytes());
     let marker_present = if feature.stdout == COMPOSEFS_DIGEST_V1_FEATURE_CONTENT {
         true

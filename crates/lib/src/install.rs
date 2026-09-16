@@ -3036,6 +3036,7 @@ mod tests {
             maj_min: "252:4".into(),
             options: "rw".into(),
             uuid: Some("965eb3c7-5a3f-470d-aaa2-1bcf04334bc6".into()),
+            id: None,
             children: None,
         };
         let kargs = bytes::Cmdline::from("");
