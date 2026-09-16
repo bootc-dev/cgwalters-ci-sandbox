@@ -1,3 +1,4 @@
 self-hosted-runner:
   labels:
     - rhel10-x86_64-16c-64g
+    - ubuntu-26.04
