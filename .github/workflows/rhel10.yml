@@ -361,15 +361,37 @@ jobs:
           # fails when this GitHub runner has no user systemd manager.
           unset DBUS_SESSION_BUS_ADDRESS
 
-          # The runner image can leave this OpenSSH client include writable by
-          # the job user.  OpenSSH then rejects it before attempting TCP, so
-          # restore the packaged ownership, mode, and SELinux label.
+          # WORKAROUND: The stock GitHub-hosted RHEL 10 partner image can have
+          # an insecure OpenSSH crypto-policy target before bootc setup. Test
+          # OpenSSH first; remove this once stock runners consistently pass.
           openssh_policy=/etc/crypto-policies/back-ends/openssh.config
-          sudo test -f "$openssh_policy"
-          sudo chown root:root "$openssh_policy"
-          sudo chmod 0644 "$openssh_policy"
-          sudo restorecon -v "$openssh_policy"
-          sudo stat -c '%A %U:%G %C %n' "$openssh_policy"
+          expected_openssh_policy_target=/usr/share/crypto-policies/DEFAULT/openssh.txt
+          openssh_policy_target=$(sudo readlink -e -- "$openssh_policy")
+          test "$openssh_policy_target" = "$expected_openssh_policy_target"
+          test "$(sudo rpm -qf --qf '%{NAME}' "$openssh_policy_target")" = crypto-policies
+          printf 'WORKAROUND confined to: %s\n' "$openssh_policy_target"
+          expected_ssh_diagnostic="Bad owner or permissions on $openssh_policy"
+          ssh_diagnostics="${RUNNER_TEMP:?}/openssh-policy-before-repair.stderr"
+          if ssh -G localhost >/dev/null 2>"$ssh_diagnostics"; then
+            printf '%s\n' 'WORKAROUND: ssh -G succeeded; partner image appears fixed, skipping repair.'
+          else
+            if ! grep -Fq -- "$expected_ssh_diagnostic" "$ssh_diagnostics"; then
+              printf '%s\n' 'Unexpected ssh -G failure; refusing to mask it:' >&2
+              cat "$ssh_diagnostics" >&2
+              exit 1
+            fi
+            printf 'WORKAROUND confirmed expected ssh -G failure: %s\n' "$expected_ssh_diagnostic"
+            printf '%s\n' '--- WORKAROUND OpenSSH policy metadata before repair ---'
+            sudo stat -c '%A %a %U:%G %C %n' -- "$openssh_policy" "$openssh_policy_target"
+            sudo chown root:root -- "$openssh_policy_target"
+            sudo chmod 0644 -- "$openssh_policy_target"
+            sudo restorecon -v -- "$openssh_policy_target"
+            test "$(sudo stat -c '%u:%g:%a' -- "$openssh_policy_target")" = 0:0:644
+            printf '%s\n' '--- WORKAROUND OpenSSH policy metadata after repair ---'
+            sudo stat -c '%A %a %U:%G %C %n' -- "$openssh_policy" "$openssh_policy_target"
+            ssh -G localhost >/dev/null
+            printf '%s\n' 'WORKAROUND: ssh -G succeeded after repair.'
+          fi
 
           # This is deliberately scoped to the reproducer.  EXIT also covers
           # timeout termination, so subsequent always-run collection sees an
