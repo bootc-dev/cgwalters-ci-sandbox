@@ -360,6 +360,21 @@ jobs:
           # to Podman: crun interprets it as a request for a systemd cgroup and
           # fails when this GitHub runner has no user systemd manager.
           unset DBUS_SESSION_BUS_ADDRESS
+
+          # This is deliberately scoped to the reproducer.  EXIT also covers
+          # timeout termination, so subsequent always-run collection sees an
+          # enforcing host rather than masking a host-side denial.
+          restore_selinux() {
+            rc=$?
+            trap - EXIT INT TERM
+            sudo setenforce 1
+            test "$(getenforce)" = Enforcing
+            exit "$rc"
+          }
+          test "$(getenforce)" = Enforcing
+          trap restore_selinux EXIT INT TERM
+          sudo setenforce 0
+          test "$(getenforce)" = Permissive
           timeout --foreground --signal=TERM --kill-after=60s 100m \
             env BOOTC_jobs=8 just test-tmt readonly
 
