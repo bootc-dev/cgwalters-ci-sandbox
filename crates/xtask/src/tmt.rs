@@ -223,26 +223,42 @@ fn wait_for_vm_ready(sh: &Shell, vm_name: &str) -> Result<(u16, String)> {
 /// Verify SSH connectivity to the VM
 /// Uses a more complex command similar to what TMT runs to ensure full readiness
 #[context("Verifying SSH connectivity")]
-fn verify_ssh_connectivity(sh: &Shell, port: u16, key_path: &Utf8Path) -> Result<()> {
+fn verify_ssh_connectivity(_sh: &Shell, port: u16, key_path: &Utf8Path) -> Result<()> {
     use std::thread;
     use std::time::Duration;
 
     let port_str = port.to_string();
+    let mut last_error = None;
     for attempt in 1..=SSH_CONNECTIVITY_MAX_ATTEMPTS {
         // Test with a complex command like TMT uses (exports + whoami)
         // Use IdentitiesOnly=yes to prevent ssh-agent from offering other keys
-        let result = cmd!(
-            sh,
-            "ssh -i {key_path} -p {port_str} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o IdentitiesOnly=yes root@localhost 'export TEST=value; whoami'"
-        )
-        .ignore_stderr()
-        .read();
+        let result = std::process::Command::new("ssh")
+            .args([
+                "-i",
+                key_path.as_str(),
+                "-p",
+                &port_str,
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "IdentitiesOnly=yes",
+                "root@localhost",
+                "export TEST=value; whoami",
+            ])
+            .output();
 
-        match &result {
-            Ok(output) if output.trim() == "root" => {
+        match result {
+            Ok(output) if output.status.success() && output.stdout.trim_ascii() == b"root" => {
                 return Ok(());
             }
-            _ => {}
+            Ok(output) => {
+                last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            }
+            Err(err) => last_error = Some(format!("failed to execute ssh: {err}")),
         }
 
         if attempt % 10 == 0 {
@@ -257,8 +273,11 @@ fn verify_ssh_connectivity(sh: &Shell, port: u16, key_path: &Utf8Path) -> Result
         }
     }
 
+    let diagnostic = last_error
+        .filter(|error| !error.is_empty())
+        .unwrap_or_else(|| "no SSH diagnostic was captured".to_owned());
     anyhow::bail!(
-        "SSH connectivity check failed after {} attempts",
+        "SSH connectivity check failed after {} attempts: {diagnostic}",
         SSH_CONNECTIVITY_MAX_ATTEMPTS
     )
 }
