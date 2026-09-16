@@ -601,6 +601,11 @@ pub(crate) fn run_tmt(sh: &Shell, args: &RunTmtArgs) -> Result<()> {
             sh,
             "bcvk libvirt run --name {vm_name} --detach {firmware_args_slice...} {COMMON_INST_ARGS...} {plan_bcvk_opts...} {log_dir_args...} {image}"
         )
+        // `cargo run` injects this search path for Rust test binaries.  Do
+        // not let libvirt propagate it to the host QEMU process: QEMU may
+        // resolve host libraries from target/debug and exit before its monitor
+        // is available.
+        .env_remove("LD_LIBRARY_PATH")
         .run()
         .context("Launching VM with bcvk");
 
