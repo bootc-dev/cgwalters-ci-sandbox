@@ -14,6 +14,7 @@ runs:
         # Pinned because tmt releases have repeatedly regressed reboot
         # handling for the `connect` provisioner we use here (e.g.
         # https://github.com/teemtee/tmt/issues/5068); bump deliberately.
+        # Version 1.78 adds granular opt-in for connect reboot commands.
         # renovate: datasource=pypi depName=tmt
-        export VERSION=1.74.0
+        export VERSION=1.78.0
         pip install --user "tmt[provision-virtual]==${VERSION}"
