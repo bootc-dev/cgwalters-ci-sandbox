@@ -376,6 +376,11 @@ jobs:
           timeout 30s bcvk libvirt list 2>&1
           timeout 30s systemctl --user --no-pager status virtqemud.socket virtlogd.socket 2>&1
           timeout 30s journalctl --user -u virtqemud -u virtlogd --no-pager -n 200 2>&1
+          # QEMU can exit before it reaches its monitor without writing an
+          # error to its own log. The kernel journal and cgroup counters
+          # identify host-side termination such as an OOM kill.
+          timeout 30s journalctl -k -b --no-pager -n 300 2>&1
+          timeout 30s cat /sys/fs/cgroup/memory.events 2>&1
           for log in /tmp/virtqemud*.log /tmp/virtlogd*.log; do
             [ -e "$log" ] || continue
             printf '\n--- %s ---\n' "$log"
