@@ -1127,7 +1127,10 @@ pub(crate) async fn get_storage() -> Result<crate::store::BootedStorage> {
     let r = BootedStorage::new(env, crate::store::EspAccess::ReadWrite)
         .await?
         .ok_or_else(|| anyhow!("System not booted via bootc"))?;
-    r.require_writable()?;
+    // Do this before returning storage to any writable caller. In particular,
+    // switch/upgrade may probe unified storage before entering the composefs
+    // pull path that also repairs this compatibility namespace.
+    r.prepare_for_write()?;
     Ok(r)
 }
 

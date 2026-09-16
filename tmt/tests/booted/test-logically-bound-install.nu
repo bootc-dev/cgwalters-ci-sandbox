@@ -2,9 +2,6 @@
 # tmt:
 #   summary: Execute logically bound images tests for installing image
 #   duration: 30m
-# extra:
-#   fixme_skip_if_composefs: true
-#
 use std assert
 use tap.nu
 
@@ -62,6 +59,10 @@ def get_file_selinux_type [p] {
 # See the relabeling we do in imgstorage.rs. We only verify types, because the role
 # may depend on the creating user.
 def test_storage_labels [] {
+    # This is the enforcing-label case.  Fresh install test 51 deliberately
+    # disables SELinux for its privileged installer container, so it must not
+    # be used as evidence that this assertion ran under enforcement.
+    assert equal (getenforce | str trim) "Enforcing"
     # Verify a representative set of storage paths. Note that
     # "defaultNetworkBackend" was removed; Podman 5.0+ dropped CNI
     # support and no longer creates that file.

@@ -274,74 +274,67 @@ Composefs installs using a traditional `vmlinuz`/`initramfs.img` layout instead 
 
 There is a `--composefs-backend` option for `bootc install` to explicitly select a composefs backend apart from sealed images; this is not as heavily tested yet.
 
-### Post-install state discovery (design; not implemented)
+### Explicit post-install mounts
 
-The narrow proposed API from the latest [#542](https://github.com/bootc-dev/bootc/issues/542)
-discussion is `bootc status --sysroot /path --json`. For an unbooted target it
-would report `UNMOUNTED` backing `/etc` and `/var` paths so an installer can
-apply post-install configuration without kernel mount syscalls. The preferred
-representation reports the shared `/var` path directly.
-
-This command does not exist today: `bootc status` has no `--sysroot` option.
-The online status path uses host command-line and ESP information and can
-migrate boot entries, so it must not be repurposed for an offline target. The
-offline implementation must inspect only target-local state and be strictly
-read-only. If the ESP is unavailable and target-local data identifies multiple
-deployments, it must reject the ambiguous request rather than guess.
-
-The additive JSON shape remains a user decision: either place state paths
-under `defaultDeployment.stateDirectories`, or add them to each deployment.
-No schema is committed by this document. The existing OSTree-specific
-post-install path in [Understanding `bootc install`](bootc-install.md) should
-be updated only after this API and JSON shape are implemented.
+Post-install tools use an explicit caller-owned mount rather than a status
+schema. `bootc install mount --sysroot /target /mnt/installed` mounts a single
+unambiguous deployment read-only and leaves it in the caller's namespace.
+`--writable` enables only persistent `/etc` and `/var`; the immutable root and
+`/usr` remain read-only. The caller must unmount the target before finalization.
 
 ## Stabilization status
 
 The composefs backend is experimental; on-disk formats are subject to change.
 
 This isolated candidate contains the V1/V2 repository, UKI, initramfs, and
-install changes, and is runtime-verified. The producer container built with
-the candidate bootc passed its real-container test. Cache/status and Type-1
-rollback prototypes are intentionally excluded and remain separate pending
-integration/VM work. Reported unit-test counts are useful regression evidence,
-not a replacement for the end-to-end matrix.
+install changes, and is runtime-verified for the scope described below. The
+producer container built with the candidate bootc passed its real-container
+test. The native logically bound image (LBI) install implementation is
+implemented and virt-validated on this stabilization branch; upstream and
+stability review are pending. Cache/status and Type-1 rollback prototypes are
+intentionally excluded and remain separate pending integration/VM work.
+Reported unit-test counts are useful regression evidence, not a replacement
+for the end-to-end matrix.
 
 ### Evidence recorded so far
 
 - Unit tests cover default V1 UKI argument ordering, explicit V2 UKI output,
   candidate selection, and V1/V2 digest generation.
-- All four selected TMT virt modes passed in the clean
-  `composefs-compat-verified-validation-20260912-02` verification round. The
-  payload source was `b9e172…` and the producer container used the real
-  candidate bootc.
-- The bootc 1.16.0 old-stager path was verified: V2 fallback booted the
-  current dual-digest UKI, a current-client update selected V1, and rollback
-  plus composefs GC succeeded. The current-stager path with a real 1.16
-  initramfs was also verified: automatic selection produced V2-only while
-  retaining current userspace. Its explicit-V1 negative control failed, and
-  the final V2 digest was verified.
-- These are opt-in, fixture-driven TMT tests, not fully automated CI coverage:
-  the fixture build recipe currently depends on ignored one-off files. Making
-  fixture production reproducible remains tracked work before treating this as
-  generally provisioned regression coverage.
-- Sealed CentOS 10 V1/V2 tests and a strict-policy downgrade-rejection control
-  were reported as passing on the combined tree. The CentOS 9 sealed-upgrade
-  case was deliberately skipped, so it is not evidence of compatibility.
+- TMT coverage has not been rerun after this rebase. The bridge and native LBI
+  plans remain opt-in fixture coverage; making their fixture production
+  reproducible remains tracked work.
 
 The verified paths do not expand the compatibility contract beyond the exact
 bootc 1.16.0 fixtures and configurations tested above.
 
 ### Design blockers (not implemented)
 
-1. **Offline post-install status API:** decide the additive JSON placement for
-   state directories (`defaultDeployment.stateDirectories` or per-deployment
-   fields) and the unambiguous-deployment rules without an ESP. Implement the
-   read-only `--sysroot` path only after that decision, then update the
-   OSTree-only installation documentation and add post-install tests.
-2. **Install-time V2 selection:** design a typed install configuration option
+1. **Install-time V2 selection:** design a typed install configuration option
    rather than an unrelated environment switch. It must consistently select
-   repository format, BLS content, and state-directory identity. Acceptance is
-   a BLS install test that proves all three agree.
+    repository format, BLS content, and state-directory identity. Acceptance is
+    a BLS install test that proves all three agree.
+2. **Native composefs logically bound images beyond the unit-tested scope:**
+   `stored` resolves locally before target mutation and copies into
+   composefs-backed bootc storage, `pull` fetches into that store, and `skip`
+   leaves it unpopulated. Fresh stores use the native path.
+   An existing real OSTree/bootc directory is reused without destructive
+   migration; the link is created or repaired only in writable installation or
+   upgrade paths. Candidate LBIs are prefetched before staging and immutable
+   LBIs are GC roots for every live deployment slot. The final forced
+   container-storage SELinux label pass runs after parent relabeling. Virt
+   coverage is unit-only until the opt-in TMT fixtures are rerun on this base.
+
+   Conservative failure gating and mixed-policy behavior have unit coverage:
+   a non-booted deployment uses the strict fallback because a public
+   per-deployment policy flag is not reliable, and an incomplete deployment
+   query skips the entire container-storage prune. Negative GC failure cases
+   are not virt-validated. Broader migration, corruption recovery, retention,
+   and per-deployment policy metadata coverage remains to be defined and
+   tested. The status API fresh-install test explicitly uses
+   `--bound-images=skip`; it is not LBI coverage.
+3. **Status cache, Type-1 rollback, and BLS V2 controls:** these remain
+   separate gaps. In particular, BLS has no supported install-time forced-V2
+   control; do not infer one from the test image-build controls.
 
 ### Remaining blockers before calling this stable
 
@@ -362,10 +355,10 @@ bootc 1.16.0 fixtures and configurations tested above.
 
 ### Pending work that is not, by itself, a stability blocker
 
-- **Mount/install API consumers:** anaconda `%post`, osbuild post-mutations,
-  and other pre-reboot consumers remain blocked on the design above (see also
-  [#522](https://github.com/bootc-dev/bootc/issues/522)). They should not
-  depend on mounting deployment directories as a stable API.
+- **Mount/install API consumers:** the explicit caller-owned mount interface
+  supports pre-reboot `/etc` and `/var` injection. Broader post-mutation
+  consumers remain separate work (see also
+  [#522](https://github.com/bootc-dev/bootc/issues/522)).
 - **V2 test controls:** `BOOTC_erofs_version` is a TMT image-build control,
   not an install API. The verified historical bridge coverage remains opt-in
   until fixture production is reproducible.

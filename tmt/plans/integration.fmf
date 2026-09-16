@@ -72,7 +72,6 @@ execute:
     how: fmf
     test:
       - /tmt/tests/tests/test-22-logically-bound-install
-  extra-fixme_skip_if_composefs: true
 
 /plan-23-install-outside-container:
   summary: Execute tests for installing outside of a container
