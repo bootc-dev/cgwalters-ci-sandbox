@@ -361,6 +361,16 @@ jobs:
           # fails when this GitHub runner has no user systemd manager.
           unset DBUS_SESSION_BUS_ADDRESS
 
+          # The runner image can leave this OpenSSH client include writable by
+          # the job user.  OpenSSH then rejects it before attempting TCP, so
+          # restore the packaged ownership, mode, and SELinux label.
+          openssh_policy=/etc/crypto-policies/back-ends/openssh.config
+          sudo test -f "$openssh_policy"
+          sudo chown root:root "$openssh_policy"
+          sudo chmod 0644 "$openssh_policy"
+          sudo restorecon -v "$openssh_policy"
+          sudo stat -c '%A %U:%G %C %n' "$openssh_policy"
+
           # This is deliberately scoped to the reproducer.  EXIT also covers
           # timeout termination, so subsequent always-run collection sees an
           # enforcing host rather than masking a host-side denial.
